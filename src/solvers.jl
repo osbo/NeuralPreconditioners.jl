@@ -1,5 +1,5 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# Iterative solvers
+# Iterative solvers and preconditioner wrappers
 # ─────────────────────────────────────────────────────────────────────────────
 
 """
@@ -31,8 +31,6 @@ end
 Preconditioned Conjugate Gradient (PCG) with a user-supplied preconditioner.
 
 `M_apply(v)` should return an approximation to A⁻¹ v.
-
-This implementation follows the standard PCG algorithm (Saad 2003, Alg. 6.18).
 """
 function pcg(A::SparseMatrixCSC, b::AbstractVector,
              M_apply::Function;
@@ -50,7 +48,6 @@ function pcg(A::SparseMatrixCSC, b::AbstractVector,
     converged = false
     iter      = 0
 
-    # Use while loop to avoid Julia's for-loop variable scoping in hard local scope
     while iter < maxiter
         iter += 1
         Ap = A * p
@@ -77,8 +74,6 @@ end
 
 """
     cg_unpreconditioned(A, b; tol, maxiter) -> SolveResult
-
-Standard (unpreconditioned) CG — baseline for comparison.
 """
 function cg_unpreconditioned(A::SparseMatrixCSC, b::AbstractVector;
                               tol::Float64=1e-8, maxiter::Int=500)
@@ -98,113 +93,56 @@ end
 """
     ssor_preconditioner(A, ω) -> Function
 
-Return a function that applies SSOR as a preconditioner for SPD systems.
-ω = 1.0 is symmetric Gauss-Seidel; ω ∈ (1, 2) gives SOR-like acceleration.
-
-SSOR inverse: M⁻¹ v = ω(2-ω) · (D + ωU)⁻¹ · D · (D + ωL)⁻¹ · v
-where L = tril(A,-1) and U = triu(A,1).
+SSOR preconditioner for SPD systems. ω=1 is symmetric Gauss-Seidel.
 """
 function ssor_preconditioner(A::SparseMatrixCSC, ω::Float64=1.0)
     d   = diag(A)
     D   = Diagonal(d)
-    # Precompute the two triangular factors (sparse)
-    DωL = D + ω .* tril(A, -1)   # D + ω L  (lower triangular)
-    DωU = D + ω .* triu(A,  1)   # D + ω U  (upper triangular)
+    DωL = D + ω .* tril(A, -1)
+    DωU = D + ω .* triu(A,  1)
     scale = ω * (2.0 - ω)
-
     function apply(v)
-        z1 = LowerTriangular(Matrix(DωL)) \ v         # forward solve
-        z2 = d .* z1                                  # diagonal scaling
-        z3 = UpperTriangular(Matrix(DωU)) \ z2        # backward solve
+        z1 = LowerTriangular(Matrix(DωL)) \ v
+        z2 = d .* z1
+        z3 = UpperTriangular(Matrix(DωU)) \ z2
         return scale .* z3
     end
-
     return apply
 end
 
-"""
-    gnn_preconditioner(graph, params) -> Function
-
-Wrap a trained GNN into a preconditioner function suitable for `pcg`.
-"""
-function gnn_preconditioner(graph::SparseGraph, params)
-    c = Float64.(gnn_predict(graph, params))
-    d = Float64.(graph.diag_inv) .* c
-    return v -> d .* v
-end
+# ── NeuralIF preconditioner ───────────────────────────────────────────────────
 
 """
-    gnn_neumann_preconditioner(A, graph, params; alpha=1.0) -> Function
+    neuralif_preconditioner(A, params, cfg) -> Function
 
-One-step Neumann-corrected learned diagonal preconditioner:
-    M(v) = y + α * D * (v - A*y),   y = D*v,   D = diag(d_gnn)
+Build a NeuralIF preconditioner for matrix A.
 
-This adds one residual-correction sweep on top of the learned diagonal and can
-capture some off-diagonal coupling while keeping the model lightweight.
+Runs the GNN once to predict L values, assembles the sparse Cholesky factor L,
+then returns a closure that applies (LL')⁻¹ via two sparse triangular solves.
+
+The closure captures L and L' as `LowerTriangular` / `UpperTriangular` wrappers
+so each PCG iteration costs O(nnz(L)) ≈ O(nnz(tril(A))).
 """
-function gnn_neumann_preconditioner(A::SparseMatrixCSC,
-                                    graph::SparseGraph, params;
-                                    alpha::Float64=1.0)
-    c = Float64.(gnn_predict(graph, params))
-    d = Float64.(graph.diag_inv) .* c
+function neuralif_preconditioner(A::SparseMatrixCSC,
+                                 params,
+                                 ::NeuralIFConfig)
+    graph  = build_neuralif_graph(A)
+    L_vals = Float64.(neuralif_forward(graph, params))
+    L_sp   = neuralif_build_L(L_vals, graph)   # sparse lower triangular (in scaled space)
+
+    L_lower = LowerTriangular(L_sp)
+    L_upper = UpperTriangular(sparse(L_sp'))   # L_s' as upper triangular
+
+    # graph.d_sqrt_inv = 1/sqrt(diag(A))
+    # M^{-1} r = D^{-1/2} (L_s L_s')^{-1} D^{-1/2} r
+    d = graph.d_sqrt_inv
+
     return v -> begin
-        y = d .* v
-        y .+ alpha .* (d .* (v .- A * y))
+        r_s = d .* Float64.(v)    # D^{-1/2} r
+        z   = L_lower \ r_s        # L_s z = r_s
+        y_s = L_upper \ z          # L_s' y_s = z
+        d .* y_s                   # D^{-1/2} y_s
     end
-end
-
-"""
-    gnn_learned_neumann_preconditioner(A, graph, params; k=2, alpha=nothing) -> Function
-
-Learned k-step Neumann-corrected diagonal preconditioner.
-
-- If `alpha` is provided, uses that fixed relaxation.
-- Otherwise uses the model-predicted relaxation from `gnn_predict_with_relaxation`.
-"""
-function gnn_learned_neumann_preconditioner(A::SparseMatrixCSC,
-                                            graph::SparseGraph, params;
-                                            k::Int=2,
-                                            alpha=nothing)
-    c, α_pred = gnn_predict_with_relaxation(graph, params)
-    α = alpha === nothing ? Float64(α_pred) : Float64(alpha)
-    d = Float64.(graph.diag_inv) .* Float64.(c)
-    kk = max(0, k)
-    return v -> begin
-        y = d .* v
-        for _ in 1:kk
-            y = y .+ α .* (d .* (v .- A * y))
-        end
-        y
-    end
-end
-
-"""
-    transformer_preconditioner(A, params, cfg) -> Function
-
-Wrap a trained transformer into a preconditioner function suitable for `pcg`.
-The block-inverse matrices are precomputed once and reused across CG iterations.
-"""
-function transformer_preconditioner(A::SparseMatrixCSC,
-                                     params, cfg::TransformerConfig)
-    p = cfg.block_size
-    n = size(A, 1)
-    K = cld(n, p)
-
-    blocks, _, _ = _extract_blocks(A, p)
-    M_blocks = [Float64.(_encode_block(blocks[k, :, :], params)) for k in 1:K]
-
-    function apply(v)
-        result = zeros(Float64, n)
-        for k in 1:K
-            i_start = (k - 1) * p + 1
-            i_end   = min(k * p, n)
-            sz      = i_end - i_start + 1
-            result[i_start:i_end] = M_blocks[k][1:sz, 1:sz] * v[i_start:i_end]
-        end
-        return result
-    end
-
-    return apply
 end
 
 # ── Krylov.jl-compatible preconditioner wrapper ───────────────────────────────
@@ -213,24 +151,12 @@ end
     NeuralPreconditionerWrapper(apply_fn)
 
 Thin wrapper that exposes a preconditioner function as a `LinearAlgebra.ldiv!`
-object, making it a drop-in preconditioner for `Krylov.cg`, `Krylov.minres`,
-`Krylov.gmres`, and all other Krylov.jl solvers.
-
-Usage
-─────
-```julia
-using Krylov
-wrapper = NeuralPreconditionerWrapper(gnn_preconditioner(graph, ps))
-x, stats = Krylov.cg(A, b; M = wrapper)
-println(stats.niter, " iterations, residual = ", stats.residuals[end])
-```
+object, making it a drop-in preconditioner for `Krylov.cg` and other solvers.
 """
 struct NeuralPreconditionerWrapper
     apply_fn :: Function
 end
 
-# 5-arg mul!: y ← α·(M⁻¹ x) + β·y
-# Krylov.jl calls this form by default (ldiv=false means mul! semantics)
 function LinearAlgebra.mul!(y::AbstractVector,
                              P::NeuralPreconditionerWrapper,
                              x::AbstractVector,
@@ -244,14 +170,12 @@ function LinearAlgebra.mul!(y::AbstractVector,
     return y
 end
 
-# 3-arg mul!: y ← M⁻¹ x  (delegates to 5-arg)
 function LinearAlgebra.mul!(y::AbstractVector,
                              P::NeuralPreconditionerWrapper,
                              x::AbstractVector)
     return LinearAlgebra.mul!(y, P, x, true, false)
 end
 
-# ldiv! forms for callers that use ldiv=true
 function LinearAlgebra.ldiv!(y::AbstractVector,
                               P::NeuralPreconditionerWrapper,
                               x::AbstractVector)

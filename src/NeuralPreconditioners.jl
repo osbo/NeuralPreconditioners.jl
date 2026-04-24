@@ -2,8 +2,8 @@
 NeuralPreconditioners.jl
 
 A Julia framework for learning-based preconditioning of sparse linear systems.
-Provides a problem-class API for training GNN and transformer preconditioners
-that plug directly into Krylov.jl solvers.
+Provides a problem-class API for training a Neural Incomplete Factorization (NeuralIF)
+preconditioner that plugs directly into Krylov.jl solvers.
 """
 module NeuralPreconditioners
 
@@ -13,7 +13,7 @@ using Random
 using Statistics
 using Printf
 using BenchmarkTools
-using NNlib: relu, softplus, softmax
+using NNlib: relu, softplus
 using Zygote
 using Optimisers
 using ChainRulesCore
@@ -21,8 +21,7 @@ using Krylov
 
 include("problems.jl")
 include("graph_utils.jl")
-include("models/gnn.jl")
-include("models/transformer.jl")
+include("models/neuralif.jl")
 include("training.jl")
 include("solvers.jl")
 include("benchmarks.jl")
@@ -43,37 +42,25 @@ export
     # Graph utilities
     SparseGraph,
     build_graph,
-    # GNN preconditioner
-    GNNConfig,
-    init_gnn_params,
-    gnn_predict,
-    gnn_predict_with_relaxation,
-    gnn_apply,
-    gnn_preconditioner,
-    gnn_neumann_preconditioner,
-    gnn_learned_neumann_preconditioner,
-    # Block-diagonal transformer preconditioner
-    TransformerConfig,
-    init_transformer_params,
-    transformer_predict,
-    transformer_apply,
-    transformer_preconditioner,
-    # Loss functions
-    sai_cosine_loss,
-    residual_loss,
-    jacobi_relative_loss,
-    frobenius_loss,
+    NeuralIFGraph,
+    build_neuralif_graph,
+    # NeuralIF preconditioner
+    NeuralIFConfig,
+    init_neuralif_params,
+    neuralif_forward,
+    neuralif_build_L,
     # Training
-    train_preconditioner!,
-    train_transformer!,
-    fine_tune!,
-    print_gnn_training_probe,
+    train_neuralif!,
+    fine_tune_neuralif!,
+    print_neuralif_probe,
+    print_neuralif_grad_probe,
     # Solvers
     SolveResult,
     pcg,
     cg_unpreconditioned,
     jacobi_preconditioner,
     ssor_preconditioner,
+    neuralif_preconditioner,
     NeuralPreconditionerWrapper,
     # Benchmarks
     BenchmarkEntry,
