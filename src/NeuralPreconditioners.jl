@@ -12,6 +12,7 @@ using SparseArrays
 using Random
 using Statistics
 using Printf
+using BenchmarkTools
 using NNlib: relu, softplus, softmax
 using Zygote
 using Optimisers
@@ -46,9 +47,11 @@ export
     GNNConfig,
     init_gnn_params,
     gnn_predict,
+    gnn_predict_with_relaxation,
     gnn_apply,
     gnn_preconditioner,
     gnn_neumann_preconditioner,
+    gnn_learned_neumann_preconditioner,
     # Block-diagonal transformer preconditioner
     TransformerConfig,
     init_transformer_params,
@@ -64,6 +67,7 @@ export
     train_preconditioner!,
     train_transformer!,
     fine_tune!,
+    print_gnn_training_probe,
     # Solvers
     SolveResult,
     pcg,

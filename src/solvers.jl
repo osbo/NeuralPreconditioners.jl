@@ -154,6 +154,31 @@ function gnn_neumann_preconditioner(A::SparseMatrixCSC,
 end
 
 """
+    gnn_learned_neumann_preconditioner(A, graph, params; k=2, alpha=nothing) -> Function
+
+Learned k-step Neumann-corrected diagonal preconditioner.
+
+- If `alpha` is provided, uses that fixed relaxation.
+- Otherwise uses the model-predicted relaxation from `gnn_predict_with_relaxation`.
+"""
+function gnn_learned_neumann_preconditioner(A::SparseMatrixCSC,
+                                            graph::SparseGraph, params;
+                                            k::Int=2,
+                                            alpha=nothing)
+    c, α_pred = gnn_predict_with_relaxation(graph, params)
+    α = alpha === nothing ? Float64(α_pred) : Float64(alpha)
+    d = Float64.(graph.diag_inv) .* Float64.(c)
+    kk = max(0, k)
+    return v -> begin
+        y = d .* v
+        for _ in 1:kk
+            y = y .+ α .* (d .* (v .- A * y))
+        end
+        y
+    end
+end
+
+"""
     transformer_preconditioner(A, params, cfg) -> Function
 
 Wrap a trained transformer into a preconditioner function suitable for `pcg`.

@@ -115,7 +115,9 @@ for n_test in test_grid_sizes
     ]
 
     entries = benchmark_preconditioners(A, rhs, preconditioners;
-                                         tol=solve_tol, maxiter=2000)
+                                         tol=solve_tol, maxiter=2000,
+                                         timing_infer_seconds=0.05,
+                                         timing_solve_seconds=0.15)
     print_benchmark_results(entries)
 
     κ_A, κ_MA = condition_number_ratio(A, d_ft)

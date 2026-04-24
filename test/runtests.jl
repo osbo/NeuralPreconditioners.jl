@@ -167,7 +167,8 @@ rng = Random.MersenneTwister(0)
         rhs = randn(rng, 64, 4)
         M_jac = jacobi_preconditioner(A)
         entries = benchmark_preconditioners(A, rhs,
-                      [("Jacobi", M_jac)]; tol=1e-8)
+                      [("Jacobi", M_jac)]; tol=1e-8,
+                      timing_infer_seconds=0.02, timing_solve_seconds=0.06)
         e = entries[1]
         @test e.iters > 0
         @test e.rel_res < 1e-6

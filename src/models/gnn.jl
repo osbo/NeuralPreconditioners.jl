@@ -22,6 +22,7 @@ Base.@kwdef struct GNNConfig
     hidden_dim :: Int = 64     # hidden embedding dimension
     n_layers   :: Int = 3      # number of GCN message-passing layers
     output_dim :: Int = 1      # outputs per node (1 for diagonal scaling)
+    relax_max  :: Float32 = 1.5f0  # max learned relaxation for Neumann updates
 end
 
 # ── Parameter initialisation ──────────────────────────────────────────────────
@@ -41,7 +42,8 @@ Parameter layout
 ────────────────
   params.embed  : initial linear embedding (node_dim → hidden_dim)
   params.layers : Tuple of GCN layer parameters (hidden_dim → hidden_dim)
-  params.output : final linear layer (hidden_dim → output_dim)
+  params.diag_head  : final linear layer (hidden_dim → output_dim)
+  params.relax_head : pooled-embedding head for Neumann relaxation α
 """
 function init_gnn_params(rng::AbstractRNG, cfg::GNNConfig)
     d_in, d_h, d_out = cfg.node_dim, cfg.hidden_dim, cfg.output_dim
@@ -54,18 +56,24 @@ function init_gnn_params(rng::AbstractRNG, cfg::GNNConfig)
     layers = Tuple(
         (
             W_agg  = _glorot(rng, d_h, d_h),
+            W_msg  = _glorot(rng, d_h, d_h),
             W_self = _glorot(rng, d_h, d_h),
             b      = zeros(Float32, d_h),
         )
         for _ in 1:cfg.n_layers
     )
 
-    output = (
+    diag_head = (
         W = _glorot(rng, d_out, d_h),
         b = zeros(Float32, d_out),
     )
 
-    return (; embed, layers, output)
+    relax_head = (
+        w = vec(_glorot(rng, 1, d_h)),
+        b = zeros(Float32, 1),
+    )
+
+    return (; embed, layers, diag_head, relax_head, relax_max=cfg.relax_max)
 end
 
 # ── Forward pass ──────────────────────────────────────────────────────────────
@@ -79,7 +87,7 @@ Run the GNN on `graph` and return positive correction factors c
 Internally uses tanh for the embedding, relu for GCN layers, and a positive
 exp-parametrisation centered at 1 for correction stability.
 """
-function gnn_predict(graph::SparseGraph, params)
+function _gnn_forward_embeddings(graph::SparseGraph, params)
     H = graph.node_features           # d_node × n  (Float32)
 
     # Initial embedding: d_node → hidden_dim
@@ -87,15 +95,40 @@ function gnn_predict(graph::SparseGraph, params)
 
     # GCN message-passing layers
     for layer in params.layers
-        # H * A_hat: aggregate neighbour embeddings (hidden_dim × n)
+        # Two channels:
+        #   - graph.A_hat: topology + magnitude (absolute normalized adjacency)
+        #   - graph.A_msg: signed operator coupling (signed normalized adjacency)
         H_agg = H * graph.A_hat
-        H = relu.(layer.W_agg * H_agg .+ layer.W_self * H .+ layer.b)
+        H_msg = H * graph.A_msg
+        H = relu.(layer.W_agg * H_agg .+ layer.W_msg * H_msg .+ layer.W_self * H .+ layer.b)
     end
+    return H
+end
 
-    # Output: hidden_dim → 1, then squeeze to n-vector
-    out = params.output.W * H .+ params.output.b    # 1 × n
+"""
+    gnn_predict_with_relaxation(graph, params) -> (c, alpha)
+
+Predict nodewise diagonal correction factors `c` and a scalar relaxation `alpha`
+for Neumann-style residual correction.
+"""
+function gnn_predict_with_relaxation(graph::SparseGraph, params)
+    H = _gnn_forward_embeddings(graph, params)
+
+    # Diagonal correction: hidden_dim → 1, then squeeze to n-vector
+    out = params.diag_head.W * H .+ params.diag_head.b
     c   = exp.(0.25f0 .* vec(out))                  # n, positive, starts near 1
 
+    # Relaxation alpha from pooled embedding, bounded for stability.
+    h_pool = vec(mean(H; dims=2))
+    α_logit = dot(params.relax_head.w, h_pool) + params.relax_head.b[1]
+    σ = 1f0 / (1f0 + exp(-Float32(α_logit)))
+    α = params.relax_max * σ
+
+    return c, α
+end
+
+function gnn_predict(graph::SparseGraph, params)
+    c, _ = gnn_predict_with_relaxation(graph, params)
     return c
 end
 

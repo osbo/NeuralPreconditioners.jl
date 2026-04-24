@@ -16,6 +16,8 @@ Fields
 - `nz_vals`      : original nonzero values (Float32)
 - `A_hat`        : symmetrically normalised adjacency with self-loops (Float32 sparse)
                    Â = D̃^{-1/2} (|A|+I) D̃^{-1/2}
+- `A_msg`        : signed symmetrically normalised operator adjacency (Float32 sparse)
+                   A_msg = D̃^{-1/2} A D̃^{-1/2}
 - `node_features`: 4×n Float32 matrix — [std_diag, std_log_rownorm, std_log_deg, sign_diag]
 - `diag_inv`     : Jacobi baseline diagonal inverse, 1 ./ diag(A) (Float32)
 """
@@ -26,6 +28,7 @@ struct SparseGraph
     col_idx      :: Vector{Int}
     nz_vals      :: Vector{Float32}
     A_hat        :: SparseMatrixCSC{Float32, Int}
+    A_msg        :: SparseMatrixCSC{Float32, Int}
     node_features:: Matrix{Float32}   # d_node × n
     diag_inv     :: Vector{Float32}
 end
@@ -74,9 +77,11 @@ function build_graph(A::SparseMatrixCSC{T}) where {T<:Real}
     D_inv_sqrt = Diagonal(d_inv_sqrt)
     A_hat_f64  = D_inv_sqrt * A_tilde * D_inv_sqrt
     A_hat      = SparseMatrixCSC{Float32, Int}(A_hat_f64)
+    A_msg_f64  = D_inv_sqrt * A * D_inv_sqrt
+    A_msg      = SparseMatrixCSC{Float32, Int}(A_msg_f64)
 
     # Jacobi baseline (safe inverse for tiny/zero diagonal entries)
     diag_inv = Float32.(1.0 ./ max.(abs.(diag_vals), 1e-12))
 
-    return SparseGraph(n, length(nz), ri, ci, Float32.(nz), A_hat, node_features, diag_inv)
+    return SparseGraph(n, length(nz), ri, ci, Float32.(nz), A_hat, A_msg, node_features, diag_inv)
 end
