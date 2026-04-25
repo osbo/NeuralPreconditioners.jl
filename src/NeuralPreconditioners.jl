@@ -10,21 +10,25 @@ module NeuralPreconditioners
 using LinearAlgebra
 using SparseArrays
 using Random
+using Serialization
 using Statistics
 using Printf
 using BenchmarkTools
-using NNlib: relu, softplus
+using NNlib: relu, softplus, scatter
 using Zygote
 using Optimisers
 using ChainRulesCore
 using Krylov
+using CUDA
 
 include("problems.jl")
 include("graph_utils.jl")
 include("models/neuralif.jl")
-include("training.jl")
+include("cuda_support.jl")
 include("solvers.jl")
+include("training.jl")
 include("benchmarks.jl")
+include("checkpoints.jl")
 
 export
     # Problem generators
@@ -62,10 +66,18 @@ export
     ssor_preconditioner,
     neuralif_preconditioner,
     NeuralPreconditionerWrapper,
+    NeuralIFPreconditioner,
+    # Checkpoints
+    save_neuralif,
+    load_neuralif,
     # Benchmarks
     BenchmarkEntry,
     benchmark_preconditioners,
     print_benchmark_results,
-    condition_number_ratio
+    condition_number_ratio,
+    # CUDA utilities
+    gpu_available,
+    to_gpu,
+    to_cpu
 
 end

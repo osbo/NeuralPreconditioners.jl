@@ -2,6 +2,31 @@
 # Training utilities for the NeuralIF preconditioner
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ── CG validation helper ──────────────────────────────────────────────────────
+
+"""
+    _validate_cg_iters(val_A, val_graph, params, cfg, rng; n_rhs, maxiter, tol)
+
+Run Krylov.cg with the current NeuralIF preconditioner on `n_rhs` random RHS
+vectors drawn from `val_A`. Returns mean CG iteration count. Always runs on CPU.
+Used to track the best checkpoint during training.
+"""
+function _validate_cg_iters(val_A::SparseMatrixCSC, val_graph::NeuralIFGraph,
+                             params, cfg::NeuralIFConfig, rng::AbstractRNG;
+                             n_rhs::Int=4, maxiter::Int=500, tol::Float64=1e-8)
+    params_cpu = to_cpu(params)
+    M       = neuralif_preconditioner(val_A, params_cpu, cfg; prebuilt_graph=val_graph)
+    wrapper = NeuralPreconditionerWrapper(M)
+    N       = size(val_A, 1)
+    total   = 0
+    for _ in 1:n_rhs
+        b = randn(rng, Float64, N)
+        _, stats = Krylov.cg(val_A, b; M=wrapper, atol=0.0, rtol=tol, itmax=maxiter)
+        total += stats.niter
+    end
+    return total / n_rhs
+end
+
 # ── Helper ────────────────────────────────────────────────────────────────────
 
 function _recursive_grad_sqnorm(g)::Float64
@@ -19,7 +44,7 @@ end
 function _accum_grad_vec!(buf::Vector{Float64}, g)
     g === nothing && return
     if g isa AbstractArray{<:Number}
-        append!(buf, vec(Float64.(g)))
+        append!(buf, vec(Float64.(Array(g))))   # Array() is no-op on CPU arrays
     elseif g isa Tuple || g isa NamedTuple
         for v in values(g)
             _accum_grad_vec!(buf, v)
@@ -30,8 +55,12 @@ end
 
 function _neuralif_grad_flat(A::SparseMatrixCSC, graph::NeuralIFGraph, params,
                              rhs_batch::AbstractMatrix)
-    _, gs = Zygote.withgradient(params) do ps
-        _neuralif_step_loss(A, graph, ps, rhs_batch)
+    # Run gradient computation on CPU for diagnostic stability
+    graph_cpu  = to_cpu(graph)
+    params_cpu = to_cpu(params)
+    rhs_cpu    = Array(rhs_batch)
+    _, gs = Zygote.withgradient(params_cpu) do ps
+        _neuralif_step_loss(A, graph_cpu, ps, rhs_cpu)
     end
     buf = Float64[]
     _accum_grad_vec!(buf, gs[1])
@@ -60,30 +89,35 @@ and mean relative residual ‖LL'b - Ab‖/‖Ab‖ vs Jacobi.
 """
 function print_neuralif_probe(A::SparseMatrixCSC, graph::NeuralIFGraph,
                                params, rhs::AbstractMatrix; io::IO=stdout)
-    L_vals = Float64.(neuralif_forward(graph, params))
-    m      = size(rhs, 2)
+    # Run diagnostics on CPU regardless of training device
+    graph_cpu  = to_cpu(graph)
+    params_cpu = to_cpu(params)
+    rhs_cpu    = Array(rhs)
+
+    L_vals = Float64.(neuralif_forward(graph_cpu, params_cpu))
+    m      = size(rhs_cpu, 2)
 
     # Hutchinson losses
-    mean_h_loss = mean(hutchinson_loss(Float32.(L_vals), graph,
-                                       Float32.(rhs[:, j])) for j in 1:m)
+    mean_h_loss = mean(hutchinson_loss(Float32.(L_vals), graph_cpu,
+                                       Float32.(rhs_cpu[:, j])) for j in 1:m)
 
     # Diagonal of L
-    d_L = L_vals[graph.is_diag .== 1f0]
+    d_L = L_vals[Array(graph_cpu.is_diag) .== 1f0]
 
     # Mean ‖L_s L_s'b_s − A_s b_s‖ / ‖A_s b_s‖ in scaled space
     rel_res = mean(1:m) do j
-        b_s  = Float32.(graph.d_sqrt_inv) .* Float32.(rhs[:, j])
-        Asbs = Float32.(graph.A_scaled * Float64.(b_s))
+        b_s  = Float32.(graph_cpu.d_sqrt_inv) .* Float32.(rhs_cpu[:, j])
+        Asbs = Float32.(graph_cpu.A_scaled * b_s)
         L32  = Float32.(L_vals)
-        Ltbs = _apply_Lt(L32, graph, b_s)
-        LLtbs = _apply_L(L32, graph, Ltbs)
+        Ltbs = _apply_Lt(L32, graph_cpu, b_s)
+        LLtbs = _apply_L(L32, graph_cpu, Ltbs)
         norm(Float64.(LLtbs) .- Float64.(Asbs)) / (norm(Asbs) + 1e-12)
     end
 
     # Jacobi relative residual on original A (for reference)
     d_jac = 1.0 ./ diag(A)
     rel_jac = mean(1:m) do j
-        b = rhs[:, j]
+        b = rhs_cpu[:, j]
         r = A * (d_jac .* b) - b
         norm(r) / (norm(b) + 1e-12)
     end
@@ -112,7 +146,8 @@ stochastic gradient noise on one instance.
 """
 function print_neuralif_grad_probe(A::SparseMatrixCSC, graph::NeuralIFGraph, params;
                                    n_rhs::Int, rng::AbstractRNG, io::IO=stdout)
-    N = size(A, 1)
+    N    = size(A, 1)
+    # Always run grad probe on CPU — it's diagnostic-only
     rhs1 = randn(rng, Float32, N, n_rhs)
     rhs2 = randn(rng, Float32, N, n_rhs)
     u = _neuralif_grad_flat(A, graph, params, rhs1)
@@ -147,18 +182,32 @@ Fresh matrices are drawn each epoch for implicit data augmentation.
 - `diagnostics`          : `false` (default) or `true`: at each verbose epoch, print operator
                           probe on the **last** matrix of the epoch plus a **gradient** probe
                           (‖g‖, cosine, ‖g₁+g₂‖/‖g₁−g₂‖) on that same matrix.
+- `val_A`                : optional held-out matrix; when provided, CG iteration count is
+                          tracked at each verbose checkpoint and the params achieving the
+                          lowest mean CG iters are returned.
 - `rng`                  : random number generator
 """
 function train_neuralif!(params,
                          problem_class::AbstractProblemClass,
-                         ::NeuralIFConfig;
+                         cfg::NeuralIFConfig;
                          n_epochs::Int             = 100,
                          n_samples_per_epoch::Int  = 4,
                          lr::Float32               = 1f-3,
                          n_rhs::Int                = 6,
                          verbose::Int              = 20,
                          diagnostics::Bool         = false,
-                         rng::AbstractRNG          = Random.default_rng())
+                         val_A::Union{SparseMatrixCSC,Nothing} = nothing,
+                         rng::AbstractRNG          = Random.default_rng(),
+                         use_cuda::Bool            = gpu_available())
+    if use_cuda
+        params = to_gpu(params)
+    end
+
+    # Build validation graph once; track best params by CG iters when val_A provided
+    val_graph   = val_A !== nothing ? build_neuralif_graph(val_A) : nothing
+    best_params = to_cpu(params)
+    best_iters  = typemax(Float64)
+
     opt       = Optimisers.Adam(lr)
     opt_state = Optimisers.setup(opt, params)
 
@@ -169,11 +218,17 @@ function train_neuralif!(params,
         last_g     = nothing
 
         for A in matrices
-            last_A = A
-            graph  = build_neuralif_graph(A)
-            last_g = graph
-            N      = size(A, 1)
-            rhs    = randn(rng, Float32, N, n_rhs)
+            last_A  = A
+            graph   = build_neuralif_graph(A)
+            last_g  = graph
+            N       = size(A, 1)
+
+            if use_cuda
+                graph = to_gpu(graph)
+                rhs   = CUDA.randn(Float32, N, n_rhs)
+            else
+                rhs   = randn(rng, Float32, N, n_rhs)
+            end
 
             loss, grads = Zygote.withgradient(params) do ps
                 _neuralif_step_loss(A, graph, ps, rhs)
@@ -193,9 +248,21 @@ function train_neuralif!(params,
                 print_neuralif_probe(last_A, last_g, params, rhs_p)
                 print_neuralif_grad_probe(last_A, last_g, params; n_rhs=n_rhs, rng=rng)
             end
+            if val_A !== nothing && val_graph !== nothing
+                cg_iters = _validate_cg_iters(val_A, val_graph, params, cfg, rng)
+                println("    │ CG iters (val_A): $(round(cg_iters, digits=1))" *
+                        (cg_iters < best_iters ? "  ← best" : ""))
+                if cg_iters < best_iters
+                    best_iters  = cg_iters
+                    best_params = to_cpu(params)
+                end
+            end
         end
     end
 
+    if val_A !== nothing
+        return use_cuda ? to_gpu(best_params) : best_params
+    end
     return params
 end
 
@@ -207,28 +274,46 @@ end
 Fine-tune a pre-trained NeuralIF on the target matrix A.
 
 # Keyword arguments
-- `n_steps`   : gradient steps (default 50)
-- `lr`        : Adam learning rate (default 5f-4)
-- `n_rhs`     : Hutchinson probes per step (default 8)
+- `n_steps`      : gradient steps (default 50)
+- `lr`           : Adam learning rate (default 5f-4)
+- `n_rhs`        : Hutchinson probes per step (default 8)
 - `verbose`      : print every N steps; 0 = silent
 - `diagnostics`  : `true` / `false` — same single probe block as `train_neuralif!`
+- `val_A`        : optional validation matrix for CG-iter tracking (pass `A` itself
+                   to select the best checkpoint by CG iters on the fine-tune target).
 """
 function fine_tune_neuralif!(params,
                               A::SparseMatrixCSC,
-                              ::NeuralIFConfig;
-                              n_steps::Int    = 50,
-                              lr::Float32     = 5f-4,
-                              n_rhs::Int      = 8,
-                              verbose::Int    = 0,
+                              cfg::NeuralIFConfig;
+                              prebuilt_graph::Union{NeuralIFGraph,Nothing}=nothing,
+                              n_steps::Int      = 50,
+                              lr::Float32       = 5f-4,
+                              n_rhs::Int        = 8,
+                              verbose::Int      = 0,
                               diagnostics::Bool = false,
-                              rng::AbstractRNG = Random.default_rng())
+                              val_A::Union{SparseMatrixCSC,Nothing} = nothing,
+                              rng::AbstractRNG  = Random.default_rng(),
+                              use_cuda::Bool    = _params_on_gpu(params))
     opt       = Optimisers.Adam(lr)
     opt_state = Optimisers.setup(opt, params)
-    graph     = build_neuralif_graph(A)
+    graph_cpu = prebuilt_graph !== nothing ? prebuilt_graph : build_neuralif_graph(A)
+    graph     = use_cuda ? to_gpu(graph_cpu) : graph_cpu
     N         = size(A, 1)
 
+    # Validation graph: reuse graph_cpu when val_A is the same matrix
+    val_graph = if val_A === A
+        graph_cpu
+    elseif val_A !== nothing
+        build_neuralif_graph(val_A)
+    else
+        nothing
+    end
+    best_params = to_cpu(params)
+    best_iters  = typemax(Float64)
+
     for step in 1:n_steps
-        rhs = randn(rng, Float32, N, n_rhs)
+        rhs = use_cuda ? CUDA.randn(Float32, N, n_rhs) : randn(rng, Float32, N, n_rhs)
+
         loss, grads = Zygote.withgradient(params) do ps
             _neuralif_step_loss(A, graph, ps, rhs)
         end
@@ -239,11 +324,23 @@ function fine_tune_neuralif!(params,
             if diagnostics
                 rhs_p = randn(rng, Float64, N, n_rhs)
                 println("    │ probe (target A): n=$N  nnz=$(nnz(A))")
-                print_neuralif_probe(A, graph, params, rhs_p)
-                print_neuralif_grad_probe(A, graph, params; n_rhs=n_rhs, rng=rng)
+                print_neuralif_probe(A, graph_cpu, params, rhs_p)
+                print_neuralif_grad_probe(A, graph_cpu, params; n_rhs=n_rhs, rng=rng)
+            end
+            if val_A !== nothing && val_graph !== nothing
+                cg_iters = _validate_cg_iters(val_A, val_graph, params, cfg, rng)
+                println("    │ CG iters (val_A): $(round(cg_iters, digits=1))" *
+                        (cg_iters < best_iters ? "  ← best" : ""))
+                if cg_iters < best_iters
+                    best_iters  = cg_iters
+                    best_params = to_cpu(params)
+                end
             end
         end
     end
 
+    if val_A !== nothing
+        return use_cuda ? to_gpu(best_params) : best_params
+    end
     return params
 end

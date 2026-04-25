@@ -8,10 +8,10 @@
 # pattern as tril(A), trained to minimise the Hutchinson approximation of
 # the Frobenius loss  E_w[ ‖LL'w − Aw‖₂ ].
 #
-# Architecture (three GraphNet layers, all edges, positional encoding):
-#   Layer 0 : edge 2  → 32, node [8+32] → 8
-#   Layer 1 : edge 33 → 32, node [8+32] → 8   (skip: append original edge val)
-#   Layer 2 : edge 33 → 1                      (final L values)
+# Architecture (two-pass blocks on lower-triangle edges + final MLP):
+#   Each block: fwd (col→row) + bwd (row→col), each with edge MLP [18→32→32] + node MLP [40→32→8]
+#   Final MLP: edge [18→32→1] — predicts raw L values
+#   Diagonal activation: exp(z/2) → 1.0 at init; off-diagonal unconstrained
 #
 # Inference: L L' y = v  solved via two sparse triangular solves.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -43,49 +43,58 @@ Graph representation of a sparse SPD matrix for NeuralIF.
 Stores the full edge set (lower + upper + diagonal) and precomputed
 structures for differentiable scatter aggregation and triangular applies.
 """
-struct NeuralIFGraph
-    n           :: Int
-    # Full edge set (row_idx[k], col_idx[k]) for all nonzeros
-    row_idx     :: Vector{Int}
-    col_idx     :: Vector{Int}
+struct NeuralIFGraph{
+    VI  <: AbstractVector{<:Integer},   # index arrays (CPU: Vector{Int}, GPU: CuVector{Int32})
+    VF  <: AbstractVector{Float32},     # Float32 feature vectors (CPU or GPU)
+    MF  <: AbstractMatrix{Float32},     # Float32 feature matrices (CPU or GPU)
+    SMD,                                # sparse Float64 matrix (CPU SparseMatrixCSC or CUSPARSE)
+    VD  <: AbstractVector{<:Real}       # diagonal scaling (CPU or GPU dense/sparse)
+}
+    n             :: Int
+    # Full edge index arrays — moveable to GPU (needed for NNlib.scatter aggregation)
+    row_idx       :: VI
+    col_idx       :: VI
     # Initial edge features: 2 × nnz_full  ([normalised a_ij; pos_enc])
-    #   pos_enc: -1 = strictly lower, 0 = diagonal, +1 = strictly upper
-    edge_init   :: Matrix{Float32}
-    # Mean scatter: (d × nnz_full) edge_emb → (d × n) node messages
-    #   m = edge_emb * S_agg   where S_agg is (nnz_full × n) precomputed
-    S_agg       :: Matrix{Float32}
-    # Lower-triangular sub-graph (i ≥ j), indices into full edge arrays
-    lower_row   :: Vector{Int}
-    lower_col   :: Vector{Int}
-    lower_eidx  :: Vector{Int}       # which full-edge k is a lower-tri edge
-    is_diag     :: Vector{Float32}   # 1.0 for diagonal edges, 0.0 for strict lower
-    # Scatter matrices for triangular apply (n × nnz_lower sparse)
-    S_row_L     :: SparseMatrixCSC{Float32}  # S_row_L[i,k]=1 if lower_row[k]=i  (for L*v)
-    S_col_L     :: SparseMatrixCSC{Float32}  # S_col_L[j,k]=1 if lower_col[k]=j  (for L'*v)
+    edge_init     :: MF
+    # Per-edge inverse degree: 1/deg(row_idx[k]).
+    # Replaces the old dense S_agg (nnz×n) matrix — O(nnz) instead of O(nnz×n).
+    inv_deg_edge  :: VF
+    # Lower-triangular sub-graph index arrays — moveable to GPU for NNlib.scatter
+    lower_row     :: VI
+    lower_col     :: VI
+    lower_eidx    :: Vector{Int}        # always CPU: GPU fancy-indexing works with CPU idx
+    is_diag            :: VF            # 1.0 for diagonal edges, 0.0 for strict lower
+    # Per-edge inverse degree for two-pass lower-triangle scatter aggregation
+    inv_deg_lower_row  :: VF            # 1/deg_row[lower_row[k]]: col→row forward sweep
+    inv_deg_lower_col  :: VF            # 1/deg_col[lower_col[k]]: row→col backward sweep
     # Node features: 8 × n
-    node_features :: Matrix{Float32}
-    # Jacobi-scaled matrix (Float64), used for Hutchinson loss
-    # A_scaled = D^{-1/2} A D^{-1/2}  (diagonal entries ≈ 1, off-diagonal ≈ O(1/n))
-    A_scaled    :: SparseMatrixCSC{Float64}
-    # Diagonal scaling: d_sqrt_inv[i] = 1/sqrt(A[i,i])
-    # At inference: M^{-1}r = D^{-1/2} (L_s L_s^T)^{-1} D^{-1/2} r
-    d_sqrt_inv  :: Vector{Float64}
+    node_features      :: MF
+    # Jacobi-scaled matrix — stored in graph precision (Float32 or Float64); moveable to CUSPARSE
+    A_scaled      :: SMD
+    # d_sqrt_inv[i] = 1/sqrt(A[i,i]); used at inference for D^{-1/2} scaling
+    d_sqrt_inv    :: VD
 end
 
 """
-    build_neuralif_graph(A) -> NeuralIFGraph
+    build_neuralif_graph(A; precision=Float32) -> NeuralIFGraph
 
 Construct a NeuralIFGraph from a sparse SPD matrix A.
+
+`precision` controls the storage type of `A_scaled` and `d_sqrt_inv`
+(the two fields that feed into preconditioner arithmetic). GNN features
+are always Float32 regardless. Use `Float64` for maximum triangular-solve
+accuracy at the cost of GPU memory and compute.
 """
-function build_neuralif_graph(A::SparseMatrixCSC{T}) where {T<:Real}
+function build_neuralif_graph(A::SparseMatrixCSC{T};
+                               precision::Type{F}=Float32) where {T<:Real, F<:AbstractFloat}
     n   = size(A, 1)
 
     # ── Jacobi scaling: Â = D^{-1/2} A D^{-1/2} ──────────────────────────────
-    # Scales the diagonal to 1.0, making L values O(1) across problem sizes.
-    d_sqrt_inv = 1.0 ./ sqrt.(abs.(Float64.(diag(A))) .+ 1e-12)
-    ri0, ci0, nz0 = findnz(SparseMatrixCSC{Float64}(A))
-    nz_s = nz0 .* d_sqrt_inv[ri0] .* d_sqrt_inv[ci0]   # scale entries
-    A_s  = sparse(ri0, ci0, nz_s, n, n)
+    # Always compute scaling in Float64 for numerical accuracy, then convert.
+    d_sqrt_inv_f64 = 1.0 ./ sqrt.(abs.(Float64.(diag(A))) .+ 1e-12)
+    ri0, ci0, nz0  = findnz(SparseMatrixCSC{Float64}(A))
+    nz_s = nz0 .* d_sqrt_inv_f64[ri0] .* d_sqrt_inv_f64[ci0]
+    A_s  = sparse(ri0, ci0, F.(nz_s), n, n)   # stored in target precision
 
     ri, ci, nz = findnz(A_s)
     nnz_full   = length(nz)
@@ -100,11 +109,12 @@ function build_neuralif_graph(A::SparseMatrixCSC{T}) where {T<:Real}
     # ── Node features (8, computed on scaled matrix) ──────────────────────────
     node_features = _build_neuralif_node_features(A_s, ri, ci, nz, n)
 
-    # ── Mean scatter matrix S_agg (nnz_full × n) ──────────────────────────────
+    # ── Per-edge inverse degree (replaces dense S_agg scatter matrix) ───────────
+    # inv_deg_edge[k] = 1/deg(ri[k]): used to compute mean aggregation via scatter.
+    # O(nnz_full) instead of O(nnz_full × n) — critical for large-problem GPU transfer.
     deg = zeros(Float32, n)
     for k in 1:nnz_full; deg[ri[k]] += 1f0; end
-    S_agg = zeros(Float32, nnz_full, n)
-    for k in 1:nnz_full; S_agg[k, ri[k]] = 1f0 / max(deg[ri[k]], 1f0); end
+    inv_deg_edge = Float32[1f0 / max(deg[ri[k]], 1f0) for k in 1:nnz_full]
 
     # ── Lower triangular sub-graph ─────────────────────────────────────────────
     lower_mask = ri .>= ci
@@ -112,14 +122,22 @@ function build_neuralif_graph(A::SparseMatrixCSC{T}) where {T<:Real}
     lower_col  = ci[lower_mask]
     lower_eidx = findall(lower_mask)
     is_diag    = Float32.(lower_row .== lower_col)
-    nnz_lower  = length(lower_row)
 
-    S_row_L = sparse(lower_row, 1:nnz_lower, ones(Float32, nnz_lower), n, nnz_lower)
-    S_col_L = sparse(lower_col, 1:nnz_lower, ones(Float32, nnz_lower), n, nnz_lower)
+    # Inverse degrees for two-pass lower-triangle scatter (mean aggregation)
+    deg_lower_row = zeros(Float32, n)
+    deg_lower_col = zeros(Float32, n)
+    for k in eachindex(lower_row)
+        deg_lower_row[lower_row[k]] += 1f0
+        deg_lower_col[lower_col[k]] += 1f0
+    end
+    inv_deg_lower_row = Float32[1f0 / max(deg_lower_row[lower_row[k]], 1f0) for k in eachindex(lower_row)]
+    inv_deg_lower_col = Float32[1f0 / max(deg_lower_col[lower_col[k]], 1f0) for k in eachindex(lower_col)]
 
-    return NeuralIFGraph(n, ri, ci, edge_init, S_agg,
+    d_sqrt_inv = F.(d_sqrt_inv_f64)
+
+    return NeuralIFGraph(n, ri, ci, edge_init, inv_deg_edge,
                          lower_row, lower_col, lower_eidx, is_diag,
-                         S_row_L, S_col_L,
+                         inv_deg_lower_row, inv_deg_lower_col,
                          node_features,
                          A_s,
                          d_sqrt_inv)
@@ -194,27 +212,29 @@ end
 
 """
     init_neuralif_params(rng, cfg) -> NamedTuple
+
+Two-pass architecture: (n_layers-1) blocks of forward+backward message passing,
+each block with separate fwd/bwd edge and node MLPs, plus a final edge prediction MLP.
+Each block captures both the forward Cholesky sweep (col→row) and backward context
+propagation (row→col), matching the paper's sequential Cholesky dependency structure.
 """
 function init_neuralif_params(rng::AbstractRNG, cfg::NeuralIFConfig)
-    d_n = cfg.n_node_features
-    d_e = cfg.d_edge
-    h   = cfg.hidden_size
+    d_n     = cfg.n_node_features   # e.g. 8
+    d_e     = cfg.d_edge            # e.g. 32
+    h       = cfg.hidden_size       # e.g. 32
+    edge_in = 2 * d_n + 2           # [x_src; x_dst; e_init(2)] per lower-triangle edge
 
-    layer_params = Tuple(
-        let is_first = (l == 1),
-            is_last  = (l == cfg.n_layers),
-            d_e_in   = is_first ? 2 : (cfg.skip_connections ? d_e + 1 : d_e),
-            d_e_out  = is_last  ? 1 : d_e
-            (
-                edge_mlp = _init_mlp(rng, [2*d_n + d_e_in, h, d_e_out]),
-                node_mlp = is_last ? nothing :
-                                     _init_mlp(rng, [d_n + d_e_out, h, d_n]),
-            )
-        end
-        for l in 1:cfg.n_layers
+    n_blocks = max(cfg.n_layers - 1, 1)
+
+    blocks = Tuple(
+        (fwd = (edge_mlp = _init_mlp(rng, [edge_in, h, d_e]),
+                node_mlp = _init_mlp(rng, [d_n + d_e, h, d_n])),
+         bwd = (edge_mlp = _init_mlp(rng, [edge_in, h, d_e]),
+                node_mlp = _init_mlp(rng, [d_n + d_e, h, d_n])))
+        for _ in 1:n_blocks
     )
-
-    return (; layers=layer_params)
+    final_mlp = _init_mlp(rng, [edge_in, h, 1])
+    return (; blocks, final_mlp)
 end
 
 # ── Forward pass ──────────────────────────────────────────────────────────────
@@ -222,53 +242,45 @@ end
 """
     neuralif_forward(graph, params) -> Vector{Float32}
 
-Run the NeuralIF GNN on `graph` and return lower-triangular L values (length
-= nnz of tril(A), including diagonal). Diagonal entries are constrained
-positive via softplus.
+Run the two-pass NeuralIF GNN on `graph` and return lower-triangular L values
+(length = nnz of tril(A), including diagonal).
+
+Each block applies:
+1. Forward sweep (col→row): aggregates along the lower-triangle graph, capturing
+   the left-to-right dependency in Cholesky: L[i,j] depends on L[i,k] for k<j.
+2. Backward sweep (row→col): propagates updated row context back to column nodes.
+
+Diagonal entries are constrained positive via exp(z/2), which initialises to
+1.0 at z=0 — correct for the unit-diagonal Jacobi-scaled system.
 """
 function neuralif_forward(graph::NeuralIFGraph, params)
-    n = graph.n
-    x = graph.node_features           # 8 × n  (Float32, constant)
-    e = graph.edge_init                # 2 × nnz_full
+    n      = graph.n
+    x      = graph.node_features                          # d_n × n
+    lr     = graph.lower_row                               # nnz_lower
+    lc     = graph.lower_col                               # nnz_lower
+    e_init = graph.edge_init[:, graph.lower_eidx]         # 2 × nnz_lower
+    inv_r  = graph.inv_deg_lower_row'                      # 1 × nnz_lower (for mean)
+    inv_c  = graph.inv_deg_lower_col'                      # 1 × nnz_lower (for mean)
 
-    # Store original edge values for skip connections (1 × nnz_full)
-    e_orig = e[1:1, :]                 # row view of normalised a_ij values
+    for block in params.blocks
+        # Forward sweep: col → row
+        m_fwd   = _apply_mlp(vcat(x[:, lc], x[:, lr], e_init), block.fwd.edge_mlp, true)
+        agg_fwd = scatter(+, m_fwd .* inv_r, lr; dstsize=(size(m_fwd, 1), n))
+        x       = relu.(_apply_mlp(vcat(x, agg_fwd), block.fwd.node_mlp))
 
-    for (l, lp) in enumerate(params.layers)
-        is_last = (l == length(params.layers))
-
-        # Skip connection: append original edge values to embedding
-        if l > 1 && !isnothing(lp.node_mlp)
-            e = vcat(e, e_orig)        # (d_e + 1) × nnz_full
-        elseif l > 1
-            # last layer also gets skip
-            e = vcat(e, e_orig)
-        end
-
-        # Edge update: input is [x[row]; x[col]; e] per edge
-        X_row = x[:, graph.row_idx]    # 8 × nnz_full
-        X_col = x[:, graph.col_idx]    # 8 × nnz_full
-        E_in  = vcat(X_row, X_col, e)  # (16 + d_e_in) × nnz_full
-        e_new = _apply_mlp(E_in, lp.edge_mlp, !is_last)  # d_e_out × nnz_full
-
-        if !is_last
-            # Node aggregation (mean) and update
-            m   = e_new * graph.S_agg  # d_e × n  (mean of incident edge embeddings)
-            X_in = vcat(x, m)          # (8 + d_e) × n
-            x   = relu.(_apply_mlp(X_in, lp.node_mlp))  # 8 × n
-        end
-
-        e = e_new
+        # Backward sweep: row → col
+        m_bwd   = _apply_mlp(vcat(x[:, lr], x[:, lc], e_init), block.bwd.edge_mlp, true)
+        agg_bwd = scatter(+, m_bwd .* inv_c, lc; dstsize=(size(m_bwd, 1), n))
+        x       = relu.(_apply_mlp(vcat(x, agg_bwd), block.bwd.node_mlp))
     end
 
-    # Extract lower-triangular output values  (nnz_lower)
-    L_raw = vec(e[1, graph.lower_eidx])
+    # Final edge prediction: one scalar per lower-triangle edge
+    L_raw = vec(_apply_mlp(vcat(x[:, lr], x[:, lc], e_init), params.final_mlp))
 
-    # Diagonal: softplus for positivity; off-diagonal: unconstrained
-    eps = 1f-3
+    # exp(z/2): diagonal entries initialized to 1.0 at z=0, always positive.
+    # Off-diagonal entries are unconstrained (positive or negative).
     L_vals = (1f0 .- graph.is_diag) .* L_raw .+
-              graph.is_diag .* (softplus.(L_raw) .+ eps)
-
+              graph.is_diag .* exp.(L_raw .* 0.5f0)
     return L_vals
 end
 
@@ -277,21 +289,23 @@ end
 """
     _apply_L(L_vals, graph, v) -> Vector
 
-Compute L * v using scatter: (L*v)[i] = Σ_{k: lower_row[k]=i} L_vals[k] * v[lower_col[k]]
+Compute L * v via differentiable scatter-add (works on CPU and GPU):
+    (L*v)[i] = Σ_{k: lower_row[k]=i} L_vals[k] * v[lower_col[k]]
 """
 function _apply_L(L_vals::AbstractVector, graph::NeuralIFGraph, v::AbstractVector)
-    scaled = L_vals .* v[graph.lower_col]   # nnz_lower
-    return vec(graph.S_row_L * scaled)       # n
+    scaled = L_vals .* v[graph.lower_col]
+    return scatter(+, scaled, graph.lower_row; dstsize=(graph.n,))
 end
 
 """
     _apply_Lt(L_vals, graph, v) -> Vector
 
-Compute L' * v using scatter: (L'*v)[j] = Σ_{k: lower_col[k]=j} L_vals[k] * v[lower_row[k]]
+Compute L' * v via differentiable scatter-add (works on CPU and GPU):
+    (L'*v)[j] = Σ_{k: lower_col[k]=j} L_vals[k] * v[lower_row[k]]
 """
 function _apply_Lt(L_vals::AbstractVector, graph::NeuralIFGraph, v::AbstractVector)
-    scaled = L_vals .* v[graph.lower_row]   # nnz_lower
-    return vec(graph.S_col_L * scaled)       # n
+    scaled = L_vals .* v[graph.lower_row]
+    return scatter(+, scaled, graph.lower_col; dstsize=(graph.n,))
 end
 
 # ── Hutchinson loss ───────────────────────────────────────────────────────────
@@ -309,7 +323,9 @@ function hutchinson_loss(L_vals::AbstractVector, graph::NeuralIFGraph,
     z32  = Float32.(z)
     y    = _apply_Lt(L_vals, graph, z32)             # L'z
     w    = _apply_L(L_vals, graph, y)                # L(L'z) = LL'z  (in scaled space)
-    Asz  = Float32.(graph.A_scaled * Float64.(z32))  # A_scaled * z  (constant wrt params)
+    # A_scaled * z is constant w.r.t. params — exclude from AD tape entirely.
+    # Float32.() is a no-op when A_scaled is already Float32; downcasts for Float64 graphs.
+    Asz  = Zygote.ignore(() -> Float32.(graph.A_scaled * z32))
     r    = w .- Asz
     Asz_norm = sqrt(sum(abs2, Asz) + 1f-8)
     return sqrt(sum(abs2, r) + 1f-12) / Asz_norm
@@ -318,13 +334,16 @@ end
 # ── Precompute sparse L and apply as preconditioner ───────────────────────────
 
 """
-    neuralif_build_L(L_vals, graph) -> SparseMatrixCSC{Float64}
+    neuralif_build_L(L_vals, graph) -> SparseMatrixCSC{F}
 
 Assemble the sparse lower-triangular Cholesky factor L from predicted values.
+Always returns a CPU sparse matrix in the graph's precision (Float32 or Float64).
+Handles GPU `L_vals` by gathering to host first.
 """
 function neuralif_build_L(L_vals::AbstractVector, graph::NeuralIFGraph)
-    return sparse(graph.lower_row, graph.lower_col,
-                  Float64.(L_vals), graph.n, graph.n)
+    F    = eltype(graph.d_sqrt_inv)   # Float32 or Float64, matches graph precision
+    vals = F.(Array(L_vals))          # GPU→CPU if needed, then convert
+    return sparse(graph.lower_row, graph.lower_col, vals, graph.n, graph.n)
 end
 
 """

@@ -109,13 +109,15 @@ rng = Random.MersenneTwister(0)
         M_jac = jacobi_preconditioner(A)
         entries = benchmark_preconditioners(A, rhs,
                       [("Jacobi", M_jac)]; tol=1e-8,
-                      timing_infer_seconds=0.02, timing_solve_seconds=0.06)
+                      timing_setup_seconds=0.02,
+                      timing_mapply_seconds=0.02,
+                      timing_solve_seconds=0.06)
         e = entries[1]
         @test e.iters > 0
         @test e.rel_res < 1e-6
         @test e.converged ≈ 1.0
         @test e.total_time_s ≥ 0
-        @test e.inference_time_s ≥ 0
+        @test e.setup_time_s == 0  # no optional setup_thunk on (name, M) rows
         @test e.solve_time_s ≥ 0
         @test e.time_per_iter_s ≥ 0
     end

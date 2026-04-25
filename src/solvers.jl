@@ -125,23 +125,46 @@ so each PCG iteration costs O(nnz(L)) ≈ O(nnz(tril(A))).
 """
 function neuralif_preconditioner(A::SparseMatrixCSC,
                                  params,
-                                 ::NeuralIFConfig)
-    graph  = build_neuralif_graph(A)
-    L_vals = Float64.(neuralif_forward(graph, params))
-    L_sp   = neuralif_build_L(L_vals, graph)   # sparse lower triangular (in scaled space)
+                                 ::NeuralIFConfig;
+                                 prebuilt_graph::Union{NeuralIFGraph,Nothing}=nothing)
+    graph_cpu = prebuilt_graph !== nothing ? prebuilt_graph : build_neuralif_graph(A)
+    F         = eltype(graph_cpu.d_sqrt_inv)   # Float32 or Float64, from graph precision
 
-    L_lower = LowerTriangular(L_sp)
-    L_upper = UpperTriangular(sparse(L_sp'))   # L_s' as upper triangular
+    if _params_on_gpu(params)
+        # ── GPU path ──────────────────────────────────────────────────────────
+        graph_dev  = to_gpu(graph_cpu)
+        L_vals_gpu = neuralif_forward(graph_dev, params)   # CuVector{Float32}
 
-    # graph.d_sqrt_inv = 1/sqrt(diag(A))
-    # M^{-1} r = D^{-1/2} (L_s L_s')^{-1} D^{-1/2} r
-    d = graph.d_sqrt_inv
+        L_sp    = neuralif_build_L(L_vals_gpu, graph_cpu)  # SparseMatrixCSC{F}
+        L_sp_up = SparseMatrixCSC(L_sp')
 
-    return v -> begin
-        r_s = d .* Float64.(v)    # D^{-1/2} r
-        z   = L_lower \ r_s        # L_s z = r_s
-        y_s = L_upper \ z          # L_s' y_s = z
-        d .* y_s                   # D^{-1/2} y_s
+        L_lower = LowerTriangular(CUDA.cu(L_sp))
+        L_upper = UpperTriangular(CUDA.cu(L_sp_up))
+        d       = CUDA.cu(graph_cpu.d_sqrt_inv)             # CuVector{F}
+
+        return v -> begin
+            # Cast input to preconditioner precision F, solve, cast back.
+            Tv  = eltype(v)
+            r_s = d .* F.(v)
+            z   = L_lower \ r_s
+            y_s = L_upper \ z
+            Tv.(d .* y_s)
+        end
+    else
+        # ── CPU path ──────────────────────────────────────────────────────────
+        L_vals  = F.(neuralif_forward(graph_cpu, params))
+        L_sp    = neuralif_build_L(L_vals, graph_cpu)
+        L_lower = LowerTriangular(L_sp)
+        L_upper = UpperTriangular(sparse(L_sp'))
+        d       = graph_cpu.d_sqrt_inv                      # Vector{F}
+
+        return v -> begin
+            Tv  = eltype(v)
+            r_s = d .* F.(v)
+            z   = L_lower \ r_s
+            y_s = L_upper \ z
+            Tv.(d .* y_s)
+        end
     end
 end
 
@@ -150,11 +173,12 @@ end
 """
     NeuralPreconditionerWrapper(apply_fn)
 
-Thin wrapper that exposes a preconditioner function as a `LinearAlgebra.ldiv!`
-object, making it a drop-in preconditioner for `Krylov.cg` and other solvers.
+Thin wrapper that exposes a callable preconditioner (`Function`, functor, etc.)
+as a `LinearAlgebra.ldiv!` object, making it a drop-in preconditioner for
+`Krylov.cg` and other solvers.
 """
-struct NeuralPreconditionerWrapper
-    apply_fn :: Function
+struct NeuralPreconditionerWrapper{T}
+    apply_fn::T
 end
 
 function LinearAlgebra.mul!(y::AbstractVector,
@@ -185,6 +209,68 @@ end
 
 function LinearAlgebra.ldiv!(P::NeuralPreconditionerWrapper,
                               x::AbstractVector)
+    x .= P.apply_fn(copy(x))
+    return x
+end
+
+# ── NeuralIFPreconditioner — user-facing type ─────────────────────────────────
+
+"""
+    NeuralIFPreconditioner
+
+A built NeuralIF preconditioner for a specific matrix A.
+
+Implements the full `LinearAlgebra.ldiv!` / `mul!` interface, making it
+compatible as a drop-in preconditioner for:
+- **Krylov.jl**: pass as the `M` keyword argument to `Krylov.cg` etc.
+- **LinearSolve.jl**: pass as the `Pl` keyword argument to `LinearSolve.solve`.
+
+# Construction
+
+    NeuralIFPreconditioner(A, params, cfg; precision=Float32, prebuilt_graph=nothing)
+
+Runs the GNN forward pass once and assembles the sparse Cholesky factor.
+All subsequent applies cost only two sparse triangular solves.
+
+Pass `precision=Float64` if the solver operates in Float64 and you need
+full-precision triangular solves (slower on GPU, more accurate on CPU).
+"""
+struct NeuralIFPreconditioner
+    apply_fn :: Function
+end
+
+function NeuralIFPreconditioner(A::SparseMatrixCSC, params, cfg::NeuralIFConfig;
+                                 precision::Type{<:AbstractFloat}=Float32,
+                                 prebuilt_graph::Union{NeuralIFGraph,Nothing}=nothing)
+    graph = if prebuilt_graph !== nothing
+        prebuilt_graph
+    else
+        build_neuralif_graph(A; precision=precision)
+    end
+    apply_fn = neuralif_preconditioner(A, params, cfg; prebuilt_graph=graph)
+    return NeuralIFPreconditioner(apply_fn)
+end
+
+# Functor: benchmarks and user code may time / call `M(v)` like other preconditioners.
+(P::NeuralIFPreconditioner)(v) = P.apply_fn(v)
+
+function LinearAlgebra.mul!(y::AbstractVector, P::NeuralIFPreconditioner,
+                             x::AbstractVector, α::Number, β::Number)
+    Px = P.apply_fn(x)
+    iszero(β) ? (y .= α .* Px) : (y .= α .* Px .+ β .* y)
+    return y
+end
+
+LinearAlgebra.mul!(y::AbstractVector, P::NeuralIFPreconditioner, x::AbstractVector) =
+    LinearAlgebra.mul!(y, P, x, true, false)
+
+function LinearAlgebra.ldiv!(y::AbstractVector, P::NeuralIFPreconditioner,
+                              x::AbstractVector)
+    y .= P.apply_fn(x)
+    return y
+end
+
+function LinearAlgebra.ldiv!(P::NeuralIFPreconditioner, x::AbstractVector)
     x .= P.apply_fn(copy(x))
     return x
 end
