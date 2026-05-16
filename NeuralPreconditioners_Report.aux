@@ -1,0 +1,54 @@
+\relax 
+\providecommand\hyper@newdestlabel[2]{}
+\providecommand\HyField@AuxAddToFields[1]{}
+\providecommand\HyField@AuxAddToCoFields[2]{}
+\@writefile{toc}{\contentsline {section}{\numberline {1}Motivation}{1}{section.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{The packaging problem.}{2}{section.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {2}Framework design}{2}{section.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Problem classes.}{3}{section.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{User-facing surface.}{3}{section.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {3}NeuralIF: reference implementation in depth}{4}{section.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.1}Two-pass message passing and the diagonal positivity prior}{4}{subsection.3.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.2}Jacobi pre-scaling}{4}{subsection.3.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.3}Per-edge inverse degree, not a dense scatter matrix}{4}{subsection.3.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.4}The Hutchinson loss}{5}{subsection.3.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.5}Diagnostics: operator probe and gradient SNR}{5}{subsection.3.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.6}Inference and Krylov.jl integration}{5}{subsection.3.6}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {4}Status: what is built}{6}{section.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {5}What the framework is designed to enable: a concrete showcase}{6}{section.5}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces Hierarchical neural preconditioning for interactive multiphase Poisson solves: weak-admissibility $\mathcal  H$-matrix prior, learned preconditioner $M \approx A^{-1}$, multiscale residual transport induced by $M$, and 3D multiphase fluid simulation application context.}}{7}{figure.caption.1}\protected@file@percent }
+\providecommand*\caption@xref[2]{\@setref\relax\@undefined{#1}}
+\newlabel{fig:teaser}{{1}{7}{Hierarchical neural preconditioning for interactive multiphase Poisson solves: weak-admissibility $\mathcal H$-matrix prior, learned preconditioner $M \approx A^{-1}$, multiscale residual transport induced by $M$, and 3D multiphase fluid simulation application context}{figure.caption.1}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.1}What the architecture does}{7}{subsection.5.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.2}The headline result}{7}{subsection.5.2}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {2}{\ignorespaces End-to-end PCG solve time on the multiphase Poisson benchmark, 20 frames per scale (mean $\pm 1\sigma $ band). Dashed grey lines mark the 24 and 60 fps interactive budgets.}}{8}{figure.caption.2}\protected@file@percent }
+\newlabel{fig:scale}{{2}{8}{End-to-end PCG solve time on the multiphase Poisson benchmark, 20 frames per scale (mean $\pm 1\sigma $ band). Dashed grey lines mark the 24 and 60 fps interactive budgets}{figure.caption.2}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.3}The loss is what unlocks the gap}{8}{subsection.5.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{The loss plays a major role.}{8}{subsection.5.3}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {3}{\ignorespaces Spectra of $MA$ on a representative multiphase Poisson frame at $N{=}1024$. Top: unpreconditioned vs.\ Jacobi. Bottom: same architecture trained with SAI loss (16$\times $ reduction, cluster anchored near $\|A\|$) vs.\ cosine-Hutchinson (68$\times $ reduction, cluster wherever angular alignment is easiest). The 4.3$\times $ quality gap is attributable to the loss alone.}}{9}{figure.caption.3}\protected@file@percent }
+\newlabel{fig:spectra}{{3}{9}{Spectra of $MA$ on a representative multiphase Poisson frame at $N{=}1024$. Top: unpreconditioned vs.\ Jacobi. Bottom: same architecture trained with SAI loss (16$\times $ reduction, cluster anchored near $\|A\|$) vs.\ cosine-Hutchinson (68$\times $ reduction, cluster wherever angular alignment is easiest). The 4.3$\times $ quality gap is attributable to the loss alone}{figure.caption.3}{}}
+\@writefile{toc}{\contentsline {paragraph}{Probe-objective alignment, not Frobenius distance, predicts PCG quality.}{9}{figure.caption.3}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {4}{\ignorespaces Training profile at $N{=}8192$. Blue: cosine-Hutchinson loss falls; orange: PCG iterations on a held-out frame fall in lockstep. Green dashed: SAI loss on the same checkpoints --- keeps falling while PCG iteration count has bottomed out and started to climb. Direct evidence that the loss the network is minimizing has to measure what CG cares about.}}{10}{figure.caption.4}\protected@file@percent }
+\newlabel{fig:training}{{4}{10}{Training profile at $N{=}8192$. Blue: cosine-Hutchinson loss falls; orange: PCG iterations on a held-out frame fall in lockstep. Green dashed: SAI loss on the same checkpoints --- keeps falling while PCG iteration count has bottomed out and started to climb. Direct evidence that the loss the network is minimizing has to measure what CG cares about}{figure.caption.4}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.4}Why a learned $M$ moves error globally where IC/Jacobi cannot}{10}{subsection.5.4}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {5}{\ignorespaces Multiscale error transport across preconditioner families on a challenging multiphase Poisson frame (closed cross-barrier topology, stiff density contrast). Top row: density $\rho $, RHS $b$, pressure $p$, $|v|$, and a top-left view of the learned $M$. Rows below: unpreconditioned CG, Jacobi, IC, AMG, and the hierarchical transformer. Each row shows $|r_k|$ on a shared log color scale at five iteration snapshots; row labels give iteration count to rtol=$10^{-8}$. At $k=1$, Jacobi and IC damp error only locally around $\mathrm  {supp}(b)$; AMG and the learned $M$ have already attenuated the residual across the whole domain --- direct evidence that the learned $M$ routes correction signals across graph-distant regions in a single apply.}}{11}{figure.caption.5}\protected@file@percent }
+\newlabel{fig:convergence}{{5}{11}{Multiscale error transport across preconditioner families on a challenging multiphase Poisson frame (closed cross-barrier topology, stiff density contrast). Top row: density $\rho $, RHS $b$, pressure $p$, $|v|$, and a top-left view of the learned $M$. Rows below: unpreconditioned CG, Jacobi, IC, AMG, and the hierarchical transformer. Each row shows $|r_k|$ on a shared log color scale at five iteration snapshots; row labels give iteration count to rtol=$10^{-8}$. At $k=1$, Jacobi and IC damp error only locally around $\mathrm {supp}(b)$; AMG and the learned $M$ have already attenuated the residual across the whole domain --- direct evidence that the learned $M$ routes correction signals across graph-distant regions in a single apply}{figure.caption.5}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {6}Comparing the framework to the showcase, honestly}{12}{section.6}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {7}Limitations and next steps}{12}{section.7}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {8}Connections to course material}{13}{section.8}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {9}Conclusion}{13}{section.9}\protected@file@percent }
+\bibcite{osborne2026}{1}
+\bibcite{hausner2023}{2}
+\bibcite{yang2025}{3}
+\bibcite{chen2024}{4}
+\bibcite{trifonov2024}{5}
+\bibcite{li2023}{6}
+\bibcite{benzi1996}{7}
+\bibcite{hackbusch2015}{8}
+\bibcite{naumov2015}{9}
+\bibcite{saad2003}{10}
+\bibcite{hutchinson1989}{11}
+\bibcite{krylovjl}{12}
+\bibcite{cudajl}{13}
+\bibcite{innes2018}{14}
+\gdef \@abspage@last{15}

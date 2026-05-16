@@ -1,0 +1,430 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{microtype}
+\usepackage{titlesec}
+\usepackage{caption}
+\usepackage{enumitem}
+\usepackage{listings}
+\usepackage{float}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!60!black,
+  urlcolor=blue!60!black,
+  citecolor=blue!60!black
+}
+
+\graphicspath{{/Users/carlosborne/Documents/MIT/UROP/Fluid Sim/Paper/figures/}}
+
+\titleformat{\section}{\large\bfseries}{\thesection}{0.6em}{}
+\titleformat{\subsection}{\normalsize\bfseries}{\thesubsection}{0.6em}{}
+
+\lstdefinelanguage{Julia}{
+  morekeywords={function,end,using,struct,return,for,in,if,else,elseif,while,abstract,type,mutable},
+  sensitive=true,
+  morestring=[b]",
+  morecomment=[l]{\#}
+}
+\lstset{
+  language=Julia,
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  showstringspaces=false,
+  frame=single,
+  framerule=0pt,
+  backgroundcolor=\color{gray!8},
+  xleftmargin=0pt,
+  xrightmargin=0pt
+}
+
+\newcommand{\code}[1]{\texttt{\small #1}}
+
+\title{\textbf{NeuralPreconditioners.jl}\\[2pt]
+\large A Julia Framework for Developing, Training, and Benchmarking\\
+Neural Preconditioners for Sparse Linear Systems}
+
+\author{Carl Osborne \\
+MIT EECS 6-4 \\
+\texttt{osbo@mit.edu}}
+
+\date{18.337 / 6.7320 --- Final Project Report --- Spring 2026}
+
+\begin{document}
+\maketitle
+
+\begin{center}
+Repository: \url{https://github.com/osbo/NeuralPreconditioners.jl}
+\end{center}
+
+\begin{abstract}
+Most large-scale scientific simulations are bottlenecked on iterative solves of sparse symmetric positive-definite (SPD) systems. Conjugate gradient (CG) convergence is governed by the spectrum of the coefficient matrix, and preconditioning --- an operator $M \approx A^{-1}$ applied each iteration --- is the standard remedy. A recent wave of work in scientific machine learning has shown that neural networks can learn preconditioners that approach AMG quality at a fraction of the GPU runtime cost, but every published method ships in a bespoke research codebase with its own matrix format, training stack, evaluation protocol, and dependencies, with no path into a real solver. Reproducing a result is a multi-day project, comparing architectures fairly is essentially impossible, and deploying any of them into a Julia simulation is a glue-code rewrite.
+
+\textbf{NeuralPreconditioners.jl} is a Julia framework that addresses this packaging problem. It unifies the moving parts of neural-preconditioner research under one contract --- a problem-class API for sampling training matrices, a shared self-supervised Hutchinson-loss training loop with GPU dispatch, diagnostic probes, checkpoint I/O, and a benchmark harness --- all consumed through Julia's standard \code{LinearAlgebra} preconditioner interface so that any trained model drops directly into \code{Krylov.jl} or \code{LinearSolve.jl}. As a reference architecture the framework ships a complete, GPU-native implementation of Neural Incomplete Factorization (NeuralIF, H\"ausner et al.\ 2023), with a graph-neural baseline and a hierarchical-transformer model under \code{src/models/} as in-progress research targets.
+
+The recently submitted paper \emph{Hierarchical Transformer Preconditioning for Interactive Physics Simulation} (Osborne, Guo, Owens, Matusik 2026) is the premier-of-class application of the techniques the framework is designed to support and is cited throughout as concrete evidence of what is now achievable in this region of preconditioner design space --- 17.9~ms/frame end-to-end PCG on a 100:1-contrast multiphase Poisson system at $N{=}8\,192$, a 2.2$\times$ speedup over GPU Jacobi and ${\approx}28\times$ over the fastest GPU AMGX IC/DILU. The CUDA/PyTorch stack in that paper sits outside Julia and outside this project; the techniques I present there --- $\mathcal H$-matrix block partitions, a cosine-Hutchinson loss, single-graph apply paths --- are exactly the kind of thing this framework is built to make easier to prototype, train, and benchmark in Julia.
+\end{abstract}
+
+\section{Motivation}
+
+A surprising fraction of scientific-computing wall time goes into solving $Ax=b$ for sparse SPD $A$ of dimension $N \in [10^6, 10^9]$. This solve appears in the pressure projection of incompressible Navier--Stokes, in implicit time-stepping for FEA, and in elliptic subproblems across climate, electromagnetics, and reservoir simulation. In a typical CFD frame on modern GPU hardware, roughly 75\% of the wall time is spent inside the linear solve. As a concrete example, a $128^3$ pressure system from a fluid simulator I wrote ($\approx$\,236k unknowns) takes 35~ms to solve to $10^{-8}$ per frame on an Apple M3 Max --- two-thirds of a 51~ms frame budget. Real-time simulators routinely loosen the tolerance to $4\cdot10^{-3}$ to hit interactive frame rates, paying for speed in physical accuracy.
+
+CG runtime decomposes as $T_{\text{total}} = k \cdot \tau_{\text{iter}}$, where $k$ is the iteration count and $\tau_{\text{iter}}$ is per-iteration cost (dominated by a sparse matvec --- bandwidth-bound on GPU). On GPU the matvec is already efficient enough that total runtime is dominated by iteration count, so reducing $k$ is the primary lever. That is what preconditioning does: applying $M \approx A^{-1}$ to the residual each iteration transforms the spectrum from $A$ to $MA$, and the classic Chebyshev bound $\|e_k\|_A \le \|e_0\|_A \min_p \max_{\lambda \in \sigma(A)} |p(\lambda)|$ collapses the iteration count when the spectrum clusters tightly.
+
+Every preconditioner sits in a quality-vs-apply-speed tradeoff. The true inverse $A^{-1}$ is perfect (CG converges in one iteration) but dense and $O(N^3)$. Jacobi is essentially free but barely moves the spectrum. The interesting middle is occupied by IC/ILU (strong on CPU, but apply via sequential triangular solves that map poorly to GPU), AMG (extremely strong, expensive setup, largely CPU-only), and AMGX (GPU AMG, but V-cycle smoothers retain memory-irregular operations that miss tensor cores). What remains underserved is the region where the preconditioner is fast to build, has substantial spectral effect, is cheap per application, and is \textbf{GPU-native end-to-end} --- and that is where neural preconditioners now live.
+
+The underlying observation is geometric: for typical elliptic PDEs $A$ is sparse and banded, but $A^{-1}$ is fully dense with smooth, long-range structure that fixed-sparsity classical preconditioners cannot represent. Neural networks are well suited to learning a structured map from a sparse operator to an approximation of its dense inverse --- and the architecture choice corresponds to a choice of receptive field. A GNN with $k$ message-passing layers sees a $k$-hop neighbourhood; a transformer with global attention sees the entire operator at quadratic memory cost; a hierarchical transformer over an $\mathcal H$-matrix partition gets a multiscale receptive field at near-linear cost. Different PDEs have different effective coupling lengths, and the architecture must match for the preconditioner to be effective and efficient.
+
+\paragraph{The packaging problem.} Despite the activity in this area, the field's published infrastructure is fragmented to the point of obstructing science. H\"ausner et al.'s NeuralIF, Chen's GNN preconditioners, Trifonov et al.'s SPAI-style learned factorizations, Li et al.'s ICML 2023 work, the Yang et al.\ 2025 SAI line, and the hierarchical-transformer follow-up cited above are each shipped as a one-off research codebase. They use different matrix formats, different training losses, different validation distributions, different reported metrics, and different software ecosystems (PyTorch, JAX, ad-hoc CUDA). The cost of reproducing a single baseline is a multi-day engineering project; the cost of fairly comparing two architectures is roughly the sum of those engineering projects; and the cost of deploying any of them into a real Julia simulation is yet another rewrite to thread the model through \code{Krylov.jl} or \code{LinearSolve.jl}. None of this is a \emph{research} problem. It is a packaging problem, and the thesis of this project is that a single well-designed Julia framework can fix it.
+
+\section{Framework design}
+
+The framework is organized around a single contract between itself and the architecture writer. Everything that does \emph{not} change between architectures lives in the framework and is shared:
+
+\begin{center}
+\small
+\begingroup
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{0.12\linewidth} >{\raggedright\arraybackslash}p{0.30\linewidth} >{\raggedright\arraybackslash}p{0.52\linewidth}@{}}
+\toprule
+Layer & Component & Role \\
+\midrule
+Data         & \code{AbstractProblemClass}, \code{sample\_matrix} & Encode a distribution over training matrices (\code{PoissonClass}, \code{HeterogeneousPoissonClass}, \code{ConvectionDiffusionClass}). \\
+Graph        & \code{build\_neuralif\_graph}, \code{NeuralIFGraph} & Translate a \code{SparseMatrixCSC} into the lower-triangular graph an architecture consumes. \\
+Training     & \code{train\_neuralif!}, \code{fine\_tune\_neuralif!} & Adam + Zygote loop with self-supervised Hutchinson probes, GPU dispatch via CUDA.jl, optional CG-iteration validation, configurable verbosity. \\
+Diagnostics  & \code{print\_neuralif\_probe}, \code{print\_neuralif\_grad\_probe} & Loss, $L$-diagonal stats, scaled residuals, and gradient-noise SNR between independent probe batches. \\
+I/O          & \code{save\_neuralif} / \code{load\_neuralif} & Serialization-based checkpoints (GPU weights persisted from CPU copies). \\
+Inference    & \code{NeuralIFPreconditioner} & One-shot forward $\to$ sparse $L$ $\to$ drop-in \code{M} for \code{Krylov.cg} or \code{Pl} for \code{LinearSolve.jl}. \\
+Benchmark    & \code{benchmark\_preconditioners} & BenchmarkTools harness over RHS batches and named preconditioners. \\
+\bottomrule
+\end{tabular}
+\endgroup
+\end{center}
+
+What the \textbf{architecture writer} provides is small: a parameter struct and a forward function mapping the graph representation of $A$ to whatever the architecture outputs (raw $L$ values, diagonal corrections, block-inverse blocks, etc.). Two architectures using the framework train on the same loss with the same optimizer on the same problem distribution, are evaluated on the same benchmark, and emit output that lands in the same Krylov-compatible interface. The comparison is genuinely apples-to-apples by construction.
+
+\paragraph{Problem classes.} A problem class is a distribution over SPD matrices, not a single matrix, so the network learns to be a preconditioner for the \emph{family} rather than overfitting to one realization.
+
+\begin{itemize}[leftmargin=*, itemsep=2pt, topsep=2pt]
+\item \code{PoissonClass} --- the 5-point 2D Laplacian sampled at a grid range.
+\item \code{HeterogeneousPoissonClass} --- $A = D \cdot A_0 \cdot D$ with a smooth random scaling field clamped to a contrast range, the variable-coefficient elliptic problems that motivate this work and that dominate real CFD pressure projections.
+\item \code{ConvectionDiffusionClass} --- non-symmetric, for GMRES-compatible architectures.
+\end{itemize}
+
+Each new class is one subtype of \code{AbstractProblemClass} with a single \code{sample\_matrix(rng, class)} method. The hierarchical-transformer line of work I pursue in that paper uses a ``multiphase Poisson'' class (closed/open barriers, $\rho_{\text{heavy}} \sim \log\text{Uniform}[5,100]$ contrast) that fits cleanly in this API --- adding it to the framework would be one file under \code{src/problems.jl}.
+
+\paragraph{User-facing surface.} From a user's perspective the three usage modes --- zero-shot (load pre-trained weights and apply), fine-tune (adapt to the user's distribution), and train from scratch --- collapse to the same final two lines:
+
+\begin{lstlisting}
+M = NeuralIFPreconditioner(A, ps, cfg)            # build preconditioner
+x, stats = Krylov.cg(A, b; M=M, atol=0.0, rtol=1e-8)  # solve
+\end{lstlisting}
+
+Step five of the workflow is \emph{identical} to a Jacobi or SSOR preconditioned solve. Trained parameters persist across machines via \code{save\_neuralif} / \code{load\_neuralif}, so the offline-train, on-device-deploy story is a single function call.
+
+\section{NeuralIF: reference implementation in depth}
+
+NeuralIF (H\"ausner et al.\ 2023) is the architecture the framework implements end-to-end. The core idea is to predict a sparse lower-triangular factor $L$ sharing the sparsity pattern of $\mathrm{tril}(A)$, trained so that $LL^\top$ approximates $A$. At inference, $Mv = (LL^\top)^{-1}v$ is applied via two sparse triangular solves. Because $L$ is lower-triangular, $LL^\top$ is always symmetric positive semidefinite; with the enforced positive diagonal in this implementation, $L$ is nonsingular and $LL^\top$ is therefore SPD. Under that condition, $(LL^\top)^{-1}$ is an SPD preconditioner for CG --- no projection or symmetric split. This section describes the choices that make the implementation framework-quality, GPU-native, and fast to train.
+
+\subsection{Two-pass message passing and the diagonal positivity prior}
+
+The architecture is a graph neural network on the lower-triangular subgraph of $A$. Each block applies a forward sweep along edges $\text{col} \to \text{row}$, then a backward sweep $\text{row} \to \text{col}$, with separate edge and node MLPs (not weight-tied). This mirrors the dependency structure of an exact Cholesky factorization --- $L[i,j]$ depends on $L[i,k]$ for $k<j$, which the forward pass propagates, while the backward pass propagates updated row context back to columns so later blocks can exploit refined information. The final edge MLP outputs one scalar per lower-triangular edge: off-diagonal scalars become $L$ values directly, while diagonal scalars pass through $\exp(z/2)$. This is always positive and equals 1.0 at $z=0$ --- exactly the unit-diagonal Jacobi-scaled identity factor the network sees as input, so the network initializes as $\approx$ identity and learns by perturbing it. This simple inductive bias matters: training converges much faster than with a free diagonal.
+
+\subsection{Jacobi pre-scaling}
+
+Before the network sees $A$, the graph stores the Jacobi-scaled operator $\tilde A = D^{-1/2} A D^{-1/2}$, $D = \mathrm{diag}(A)$. The scaled matrix has unit diagonal and a much tamer dynamic range. Edge features are computed on the scaled matrix and normalized by max absolute value, so they live in a bounded range regardless of the original problem's coefficient scale. At inference, the original-space preconditioner is recovered by $M v = D^{-1/2} (LL^\top)^{-1} D^{-1/2} v$ --- Jacobi scaling is undone outside the triangular solves. Every problem class the network trains on therefore has the same effective scale, which is a significant regularization.
+
+\subsection{Per-edge inverse degree, not a dense scatter matrix}
+
+A naive GNN aggregates messages by multiplying a feature matrix by a dense scatter matrix $S_{\text{agg}} \in \mathbb{R}^{\text{nnz}\times n}$. For a Poisson problem at $N{=}8\,192$, that matrix has $\approx 40{,}000 \times 8{,}192 \approx 3\cdot 10^8$ entries --- over a gigabyte at Float32 before the GPU transfer. The framework instead stores a per-edge inverse-degree vector \code{inv\_deg\_lower\_row} of length \code{nnz\_lower} (under 30{,}000 floats for the same problem) and uses \code{NNlib.scatter} for the aggregation: mean-aggregation of edge messages onto target nodes in $O(\text{nnz})$ time and memory, with a Zygote-differentiable backward pass also $O(\text{nnz})$. On GPU, \code{NNlib.scatter} dispatches to a CUDA kernel using 32-bit indices for atomic adds. This is the single most important engineering decision for scaling --- without it the dense scatter would dominate memory transfers in every training step.
+
+\subsection{The Hutchinson loss}
+
+Training is fully self-supervised. For any $z \sim \mathcal N(0, I)$,
+\[
+\mathbb E_z\!\left[\| (M - A^{-1})\,z \|_2^2\right] = \| M - A^{-1} \|_F^2.
+\]
+The factorization version asks $LL^\top z$ to approximate $Az$ for random $z$, giving the per-probe loss
+\[
+\ell(z;\theta) \;=\; \frac{\| LL^\top z - A z\|_2}{\| A z\|_2}
+\]
+evaluated in Jacobi-scaled space. The denominator gives a relative residual that is scale-invariant in $A$, matching CG's own scale invariance. Each gradient step requires only one $Az$, one $L^\top z$, and one $Lz$ --- never an inverse. $L\cdot v$ and $L^\top\cdot v$ are implemented as scatter operations over the lower-triangular indices rather than as triangular solves, so the entire forward and backward pass is differentiable through Zygote on both CPU and GPU. The $Az$ computation is wrapped in \code{Zygote.ignore}: $\tilde A$ and $z$ are constants w.r.t.\ the parameters and excluding them from the AD tape eliminates a transient memory spike in the backward pass for the sparse matvec.
+
+The framework's training loop is loss-agnostic --- the architecture writer supplies a \code{loss\_fn(ps, cfg, A, z) -> scalar} and the loop handles probe generation, batching, optimizer state, GPU dispatch, gradient probes, and CG validation. The recently developed \textbf{cosine-Hutchinson loss} from my paper (Osborne et al.\ 2026) --- which replaces the distance-between-vectors $\|\frac{1}{\|A\|} AMz - z\|^2$ used by Yang et al.\ 2025 with a distance-between-subspaces $1 - \cos^2 \theta(z, MAz)$ --- is exactly the kind of swap the framework is designed to make a one-function change. The argument I present there for that loss, with a 4.3$\times$ quality gap attributed to the loss swap alone on the multiphase Poisson benchmark below, is reproduced in \S5.
+
+\subsection{Diagnostics: operator probe and gradient SNR}
+
+Self-supervised preconditioner training can fail silently --- the loss can decrease while the preconditioner becomes \emph{worse} for downstream CG iterations. Two diagnostic probes are built in.
+
+\begin{itemize}[leftmargin=*, itemsep=2pt, topsep=2pt]
+\item \textbf{Operator probe.} Prints mean Hutchinson loss, statistics on the predicted $L$ diagonal (catching exploding outputs), and the relative residual $\| LL^\top b - \tilde A b\| / \| \tilde A b\|$ on a held-out RHS batch, alongside the same metric for plain Jacobi as a baseline.
+\item \textbf{Gradient SNR probe.} Draws two independent Hutchinson batches, computes their gradient vectors with Zygote, and reports their magnitudes, cosine similarity, and the stability ratio $\|g_1+g_2\| / \|g_1-g_2\|$. These quantities measure how much of each gradient comes from the actual loss landscape versus from Hutchinson noise. Cosines in 0.3--0.7 early in training improving toward 0.9+ at convergence are typical and indicate that probe count is an important hyperparameter.
+\end{itemize}
+
+When \code{val\_A} is supplied, the framework also runs a \code{Krylov.cg} solve at each verbose checkpoint, tracks iteration count, and selects the parameters that achieve the lowest mean iterations --- early-stopping on the actual downstream metric rather than the noisy Hutchinson proxy. This is non-trivially important: Fig.~\ref{fig:training} from my paper shows the SAI loss falling steadily while PCG iteration count climbs back up over the second half of training, the empirical signature of a loss that does not measure what CG cares about.
+
+\subsection{Inference and Krylov.jl integration}
+
+Inference is decoupled from training. Once $L$ values are predicted they are assembled into a sparse lower-triangular matrix on the host, wrapped in \code{LowerTriangular} / \code{UpperTriangular}, and used in two triangular solves; on GPU the wrappers are pushed to CUSPARSE-backed \code{CuSparseMatrixCSC}. The preconditioner is a closure capturing precomputed $L$ and $L^\top$, the diagonal scaling $D^{-1/2}$, and a precision $F$ (Float32 / Float64) for stored matrices. The closure casts on entry and exit so \code{Krylov.jl}'s default Float64 solver sees a Float64-in/Float64-out preconditioner regardless of storage precision --- there is no measurable accuracy degradation in observed residual histories because the preconditioner is approximate anyway and the small Float32 triangular-solve error is well below CG tolerance.
+
+The user-facing \code{NeuralIFPreconditioner} type implements \code{LinearAlgebra.mul!} (both 5- and 3-argument forms) and \code{LinearAlgebra.ldiv!} (both 2- and 1-argument forms), so it is a drop-in replacement for any other \code{M} in \code{Krylov.cg}, \code{Krylov.minres}, or any solver accepting a left preconditioner. It is also accepted as \code{Pl} in \code{LinearSolve.jl}, which dispatches through the same \code{LinearAlgebra} interfaces. The framework-level decision to commit to these abstractions is what makes ``offline-train, on-device-deploy'' a one-liner instead of an integration project.
+
+\section{Status: what is built}
+
+The package is functional and exercised at the level needed for research and demo use:
+
+\begin{itemize}[leftmargin=*, itemsep=2pt, topsep=2pt]
+\item The \textbf{problem-class API} is complete with three concrete classes.
+\item \textbf{Graph construction} (\code{SparseGraph} for diagnostics, \code{NeuralIFGraph} for training) is complete and tested.
+\item The \textbf{NeuralIF model} --- forward pass, parameter init, sparse-$L$ assembly, scatter-based $L \cdot v$ / $L^\top \cdot v$ --- is complete.
+\item \textbf{Krylov.jl integration} is verified end-to-end; the test suite checks that the Jacobi and NeuralIF wrappers both reduce iterations vs.\ bare CG.
+\item \textbf{Training and fine-tuning loops} are smoke-tested with the gradient-probe diagnostic.
+\item \textbf{Checkpointing} round-trips.
+\item \textbf{CUDA support} has been exercised on Engaging cluster GPUs.
+\item A \textbf{GNN baseline} and a \textbf{transformer sketch} live under \code{src/models/} as in-progress research architectures (not exported from the public surface yet).
+\item Example scripts (\code{examples/poisson\_2d.jl}, \code{examples/compare\_preconditioners.jl}) walk through class setup, phased training, fine-tuning, checkpoint I/O, and benchmarking.
+\end{itemize}
+
+\begin{lstlisting}
+julia --project=. examples/poisson_2d.jl
+julia --project=. -e 'using Pkg; Pkg.test()'
+\end{lstlisting}
+
+The framework's value sits at the design level: it is the right shape to absorb new architectures cheaply. Concretely, adding an architecture is a struct of parameters, a \code{forward(ps, graph) -> output} function, a small adapter that wraps \code{output} as a \code{Krylov.jl}-compatible operator, and (optionally) a loss function. The training loop, problem classes, diagnostics, checkpoint I/O, and benchmarks are reused without modification.
+
+\section{What the framework is designed to enable: a concrete showcase}
+
+The framework's purpose is to make research like the recently submitted \emph{Hierarchical Transformer Preconditioning for Interactive Physics Simulation} (Osborne, Guo, Owens, Matusik 2026) cheap to prototype, reproduce, and benchmark. The stack in that paper is PyTorch + custom CUDA Graph capture and sits outside both Julia and the scope of this class, but it is the premier showcase of the design space this framework targets, and it is worth describing what it achieves in order to motivate the framework concretely. Every figure in this section comes from that paper's repository.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\linewidth]{teaser_4panel_highres.png}
+\caption{Hierarchical neural preconditioning for interactive multiphase Poisson solves: weak-admissibility $\mathcal H$-matrix prior, learned preconditioner $M \approx A^{-1}$, multiscale residual transport induced by $M$, and 3D multiphase fluid simulation application context.}
+\label{fig:teaser}
+\end{figure}
+
+\subsection{What the architecture does}
+
+The architecture anchors the preconditioner to a weak-admissibility $\mathcal H$-matrix block partition (dense diagonal leaves of size $L \times L$, plus off-diagonal tiles of size $S_m \times S_m$ shrinking with distance from the diagonal --- computed analytically from the leaf-index geometry, reused every frame). A two-stream transformer operates on this layout: a \emph{diagonal} stream emits one full-rank factor per leaf, an \emph{off-diagonal} stream emits one rank-$L_s$ factor per tile with constant coarse-token count $L_s \ll L$ regardless of $S$, so the rank fraction $L_s / (SL)$ shrinks with separation --- exactly what the $\mathcal H$-matrix prior calls for. Inter-block coupling is routed through \emph{highway buffers} (axial row/column bands plus a single global summary token) that propagate context across transformer depth in $O(N)$ scale. At each PCG iteration the apply is a chain of batched dense GEMMs with regular memory access --- no triangular solves, no V-cycle, no data-dependent branching --- captured into a single CUDA Graph.
+
+\subsection{The headline result}
+
+On the same multiphase Poisson benchmark across five problem sizes ($N \in \{1\,024, \ldots, 16\,384\}$, $\rho_{\text{heavy}} \sim \log\text{Uniform}[5,100]$, $\text{rtol}=10^{-8}$, NVIDIA H200):
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.85\linewidth]{scale_methods.png}
+\caption{End-to-end PCG solve time on the multiphase Poisson benchmark, 20 frames per scale (mean $\pm 1\sigma$ band). Dashed grey lines mark the 24 and 60 fps interactive budgets.}
+\label{fig:scale}
+\end{figure}
+
+\begin{center}
+\small
+\begin{tabular}{@{}l r r r r r@{}}
+\toprule
+Method & $N{=}1024$ & $N{=}2048$ & $N{=}4096$ & $N{=}8192$ & $N{=}16\,384$ \\
+\midrule
+Unprec.\ CG (GPU)            & 18.5 (497)  & 24.7 (650)  & 43.6 (1153) & 77.6 (1765) & 89.2 (2103) \\
+Jacobi (GPU)                  & 12.7 (325)  & 16.1 (429)  & 31.7 (839)  & 39.5 (968)  & 65.7 (1543) \\
+AMGX SPAI (GPU)               & 53.2 (1)    & 82.0 (1)    & 76.0 (1)    & 134.5 (2)   & 188.3 (3)   \\
+IC / DILU (GPU)               & 139.5 (11)  & 208.4 (15)  & 312.8 (22)  & 503.0 (30)  & 579.7 (40)  \\
+Neural SPAI (GPU) {[Yang 2025]} & 18.4 (118)  & 26.8 (167)  & 38.3 (246)  & 48.1 (338)  & 70.9 (496)  \\
+\textbf{Hierarchical Transformer (GPU)} & \textbf{7.0 (47)} & \textbf{8.8 (66)} & \textbf{9.2 (80)} & \textbf{17.9 (168)} & \textbf{47.6 (394)} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+End-to-end PCG solve time in ms with iteration counts in parentheses. The architecture runs at interactive framerates across the entire size range: 17.9~ms ($\approx$\,56~fps) at $N{=}8\,192$ and 47.6~ms ($\approx$\,21~fps) at $N{=}16\,384$, \textbf{2.2$\times$ over GPU Jacobi}, \textbf{$\approx$\,28$\times$ over GPU IC/DILU} (AMGX \code{MULTICOLOR\_DILU}), and \textbf{2.7$\times$ over neural SPAI retrained per scale}.
+
+The interesting failure mode of the AMGX baselines is informative for the framework's design rationale: AMGX SPAI reaches the answer in 1--3 iterations at every size, but \textbf{per-iteration cost} dominates the runtime because the apply is bandwidth-bound on sparse triangular solves and V-cycle synchronization. Iteration count alone is the wrong metric for GPU preconditioners; the framework's benchmark harness reports both, and the \code{print\_neuralif\_probe} diagnostic surfaces per-iteration cost alongside loss precisely to keep both visible during model development.
+
+\subsection{The loss is what unlocks the gap}
+
+Two findings from my paper are directly relevant to \emph{what} the framework should make easy to evaluate.
+
+\paragraph{The loss plays a major role.} Trained with the SAI loss of Yang et al.\ 2025, the same hierarchical-transformer architecture delivers a 16$\times$ iteration reduction vs.\ Jacobi with the spectrum cluster anchored near $\|A\|$ (where the Frobenius objective demands); trained with the cosine-Hutchinson loss the same architecture delivers a 68$\times$ reduction, with the cluster anywhere angular alignment is easiest. This 4.3$\times$ gap comes from the loss swap alone within the same architecture.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.7\linewidth]{solver_spectral_clustering.png}
+\caption{Spectra of $MA$ on a representative multiphase Poisson frame at $N{=}1024$. Top: unpreconditioned vs.\ Jacobi. Bottom: same architecture trained with SAI loss (16$\times$ reduction, cluster anchored near $\|A\|$) vs.\ cosine-Hutchinson (68$\times$ reduction, cluster wherever angular alignment is easiest). The 4.3$\times$ quality gap is attributable to the loss alone.}
+\label{fig:spectra}
+\end{figure}
+
+\paragraph{Probe-objective alignment, not Frobenius distance, predicts PCG quality.} The cosine-Hutchinson loss is invariant under positive rescaling of $M$ (Prop.~1 in my paper), so it descends to a well-defined function on the quotient of preconditioners modulo scale. Geometrically it is a distance on the projective space $\mathbb P(\mathbb R^{N K_z})$ rather than a Euclidean distance, and the PCG-relevant property --- relative spread of $\sigma(MA)$, not absolute location --- is exactly what that quotient sees. The empirical signature is a clean lockstep between $\mathcal L_{\cos}$ falling and PCG-iteration count falling, in contrast to the SAI loss which can fall while PCG iterations climb.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.75\linewidth]{training.png}
+\caption{Training profile at $N{=}8192$. Blue: cosine-Hutchinson loss falls; orange: PCG iterations on a held-out frame fall in lockstep. Green dashed: SAI loss on the same checkpoints --- keeps falling while PCG iteration count has bottomed out and started to climb. Direct evidence that the loss the network is minimizing has to measure what CG cares about.}
+\label{fig:training}
+\end{figure}
+
+This is exactly the failure mode the framework's \code{print\_neuralif\_probe} and the optional CG-iteration tracking on \code{val\_A} are designed to catch. The diagnostic infrastructure makes the SAI-vs-cosine swap a small, well-scoped study to run inside the framework rather than two separately-instrumented research codebases. A user adding the cosine-Hutchinson loss to NeuralPreconditioners.jl writes one \code{loss\_fn}, points it at any architecture in \code{src/models/}, and the existing training loop, diagnostics, and benchmark harness produce a head-to-head comparison.
+
+\subsection{Why a learned $M$ moves error globally where IC/Jacobi cannot}
+
+A final piece of evidence for the design space the framework targets --- and for why purely local preconditioners (IC, Jacobi) cannot match an $\mathcal H$-matrix-structured learned $M$ on long-range coupling problems:
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.82\linewidth]{multiphase_convergence.png}
+\caption{Multiscale error transport across preconditioner families on a challenging multiphase Poisson frame (closed cross-barrier topology, stiff density contrast). Top row: density $\rho$, RHS $b$, pressure $p$, $|v|$, and a top-left view of the learned $M$. Rows below: unpreconditioned CG, Jacobi, IC, AMG, and the hierarchical transformer. Each row shows $|r_k|$ on a shared log color scale at five iteration snapshots; row labels give iteration count to rtol=$10^{-8}$. At $k=1$, Jacobi and IC damp error only locally around $\mathrm{supp}(b)$; AMG and the learned $M$ have already attenuated the residual across the whole domain --- direct evidence that the learned $M$ routes correction signals across graph-distant regions in a single apply.}
+\label{fig:convergence}
+\end{figure}
+
+At $k=1$, Jacobi and IC damp the residual only locally around the right-hand-side support; AMG and the learned $M$ have already attenuated error across the whole domain. The learned $M$ routes correction signals across graph-distant regions in a single apply --- the global routing pattern the highway buffers implement. AMG matches the spread but pays for it in V-cycle synchronization per iteration; the learned $M$ runs the inner loop as a single CUDA-Graph-captured sequence of batched GEMMs.
+
+\section{Comparing the framework to the showcase, honestly}
+
+The framework does not yet contain the hierarchical-transformer architecture above. What it does contain is the infrastructure that makes adding it tractable as a standalone module rather than a parallel codebase. The mapping is concrete:
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{0.22\linewidth} p{0.36\linewidth} p{0.36\linewidth}@{}}
+\toprule
+Capability & Hierarchical-Transformer paper (Python) & NeuralPreconditioners.jl \\
+\midrule
+Problem distribution     & Bespoke multiphase Poisson generator + RHS pipeline & One \code{AbstractProblemClass} subtype with a \code{sample\_matrix} method \\
+Self-supervised loss     & Cosine-Hutchinson, hand-instrumented & \code{loss\_fn(ps, cfg, A, z) -> scalar} plugged into shared loop \\
+Gradient diagnostics     & Probe-alignment plots, custom & \code{print\_neuralif\_grad\_probe} (cosine + stability ratio) \\
+Validation signal        & PCG-iteration tracking & Optional CG validation on \code{val\_A} \\
+Optimizer + GPU dispatch & Custom AdamW + CUDA Graph capture & Shared Adam + CUDA.jl \\
+Inference path           & Triton/CUDA + CUDA Graph & \code{mul!} / \code{ldiv!} on Krylov.jl-compatible operator \\
+Benchmark                & Custom timing scripts & \code{benchmark\_preconditioners} over named methods \\
+Deploy into a simulator  & PyTorch glue + bespoke FFI & \code{M=...} keyword to \code{Krylov.cg} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Most of the right-hand column is \emph{done} and validated for NeuralIF. The $\mathcal H$-matrix block transformer, the highway buffers, and the cosine-Hutchinson loss are research items that would land as one model file under \code{src/models/}, one \code{loss\_fn}, and possibly one new problem class --- not a separate codebase.
+
+\section{Limitations and next steps}
+
+Three limitations.
+
+\begin{enumerate}[leftmargin=*, itemsep=2pt, topsep=2pt]
+\item \textbf{NeuralIF inference applies $(LL^\top)^{-1}$ via sparse triangular solves}, which are fundamentally sequential along $L$'s matrix levels and underperform dense matmul on GPU --- the shared weakness of any incomplete-factorization preconditioner on accelerator hardware. The hierarchical-transformer architecture specifically avoids this (its inference is dense batched GEMMs) and is the right target for the GPU-native deployment story. Porting it to the framework is the largest remaining single piece of work.
+\item \textbf{AD on the Hutchinson loss is noisy.} The gradient SNR probe routinely shows cosines of 0.3--0.7 between independent batches early in training, so probe count is an important hyperparameter; the current default of 6--8 probes is a compromise. The recipe I use in my paper, $K_z = \max(64, \lceil\sqrt N\rceil)$, is a more principled scaling and would be straightforward to add as a default policy.
+\item \textbf{CG-iteration validation is the right early-stopping signal but costs more than loss alone}, limiting validation cadence on large problems. The current implementation amortizes the cost by validating only at verbose checkpoints; a sampled-validation policy that adapts cadence to recent loss-vs-iteration agreement is a clean future addition.
+\end{enumerate}
+
+Next steps, in priority order:
+
+\begin{enumerate}[leftmargin=*, itemsep=2pt, topsep=2pt]
+\item \textbf{Port the $\mathcal H$-matrix block transformer} from the Python prototype in my paper as a new \code{src/models/} module. The framework is structured to receive it cleanly.
+\item \textbf{Add the cosine-Hutchinson loss} as an alternative \code{loss\_fn} and reproduce the SAI-vs-cosine ablation inside the framework on \code{HeterogeneousPoissonClass}.
+\item \textbf{Broaden the problem-class library} with the multiphase Poisson distribution, anisotropic diffusion, 3D Poisson, and FEA elasticity.
+\item \textbf{Publish a small registry of pre-trained checkpoints} for common problem classes to realize the zero-shot deployment story.
+\item \textbf{Reproduce the scale-sweep table} with the Julia NeuralIF and the ported transformer against IC(0), AMG, AMGX, and the Python H-matrix transformer on the same H200 hardware.
+\end{enumerate}
+
+\section{Connections to course material}
+
+Several pieces of 18.337 / 6.7320 material were directly applied.
+
+\begin{itemize}[leftmargin=*, itemsep=2pt, topsep=2pt]
+\item \textbf{Composable interfaces.} HW2's connection between Tsit5 stages and CG iterations --- both inner-cost-times-iteration-count structures behind generic interfaces --- is the same idea exploited here for the \code{M=} keyword in \code{Krylov.cg}. The framework-level decision that \code{NeuralIFPreconditioner} implements \code{LinearAlgebra.mul!} and \code{ldiv!} works only because Julia's iterative-solver ecosystem agreed on these abstractions: a concrete instance of the course theme that interface design and ecosystem composability are as important as raw performance.
+\item \textbf{Arithmetic intensity and memory traffic.} The decision to use scatter-based aggregation instead of dense scatter matrices (\S3.3) is informed directly by the course's treatment of memory hierarchies. The architecture choice in my showcase paper --- dense block GEMMs over sparse triangular solves --- is the same lesson applied one level up, at the level of architecture selection rather than implementation detail.
+\item \textbf{Source-to-source AD.} Zygote, filtered with the \code{Zygote.ignore} optimization for parameter-independent branches (\S3.4), is a course-taught technique. The Hutchinson loss and its gradient-noise diagnostics use AD exactly as the course presented it.
+\item \textbf{Self-supervised, scale-invariant losses.} The relative Hutchinson loss (\S3.4) and its cosine-subspace generalization (\S5.3) are concrete applications of the course's treatment of scale invariance and conditioning to the design of training objectives.
+\end{itemize}
+
+\section{Conclusion}
+
+Neural preconditioners are a promising tool for accelerating iterative solvers, and recent work --- including the hierarchical-transformer line surveyed in \S5 --- shows that they can deliver interactive-framerate solves on stiff multiphase Poisson systems where classical GPU preconditioners cannot. The bottleneck slowing adoption is not the research but the packaging: every method ships as a one-off codebase that nothing else in Julia (or any other simulation ecosystem) can consume. \textbf{NeuralPreconditioners.jl} addresses this with a single problem-class API, a single self-supervised training loop with diagnostics, full GPU support, transparent precision handling, checkpointing, and a benchmark harness, all consumed through a \code{Krylov.jl}- and \code{LinearSolve.jl}-compatible interface. NeuralIF is fully implemented end-to-end as a reference architecture; the framework is structured so that the next architecture --- including the hierarchical transformer that is the premier showcase of where this design space is headed --- is a model file rather than a new project.
+
+The contribution is not a new architecture. It is the infrastructure that makes the comparison of architectures honest, the deployment of any of them straightforward, and the development of new ones materially cheaper.
+
+\begin{thebibliography}{99}
+\small
+
+\bibitem{osborne2026}
+C. Osborne, M. Guo, C. Owens, W. Matusik.
+\emph{Hierarchical Transformer Preconditioning for Interactive Physics Simulation.}
+arXiv:2605.13343, 2026.
+
+\bibitem{hausner2023}
+D. H\"ausner, O. Eberhard, J. L\"assig.
+\emph{Neural incomplete factorization: learning preconditioners for the conjugate gradient solver.}
+arXiv:2305.16368, 2023.
+
+\bibitem{yang2025}
+Z. Yang, Z. Lyu, Y. Li, T. Du, L. Liu.
+\emph{Learning Sparse Approximate Inverse Preconditioners for Conjugate Gradient Solvers on GPUs.}
+arXiv:2510.27517, 2025.
+
+\bibitem{chen2024}
+J. Chen.
+\emph{Graph neural preconditioners for iterative solutions of sparse linear systems.}
+arXiv:2406.00809, 2024.
+
+\bibitem{trifonov2024}
+V. Trifonov, A. Rudikov, O. Iliev, Y. M. Laevsky, I. Oseledets, E. Muravleva.
+\emph{Learning from Linear Algebra: A Graph Neural Network Approach to Preconditioner Design for Conjugate Gradient Solvers.}
+arXiv:2405.15557, 2024.
+
+\bibitem{li2023}
+Y. Li, P. Y. Chen, T. Du, W. Matusik.
+\emph{Learning Preconditioners for Conjugate Gradient PDE Solvers.}
+arXiv:2305.16432, 2023.
+
+\bibitem{benzi1996}
+M. Benzi, C. D. Meyer, M. T\r{u}ma.
+\emph{A Sparse Approximate Inverse Preconditioner for the Conjugate Gradient Method.}
+SIAM J. Sci. Comput.\ 17(5), 1996.
+
+\bibitem{hackbusch2015}
+W. Hackbusch.
+\emph{Hierarchical Matrices: Algorithms and Analysis.}
+Springer, 2015.
+
+\bibitem{naumov2015}
+M. Naumov et al.
+\emph{cuSPARSE Library.}
+NVIDIA GTC, 2015.
+
+\bibitem{saad2003}
+Y. Saad.
+\emph{Iterative Methods for Sparse Linear Systems} (2nd ed.).
+SIAM, 2003.
+
+\bibitem{hutchinson1989}
+M. F. Hutchinson.
+\emph{A stochastic estimator of the trace of the influence matrix for Laplacian smoothing splines.}
+Comm. Stat. --- Simul. Comput.\ 18(3), 1989.
+
+\bibitem{krylovjl}
+A. Montoison, D. Orban, et al.
+\emph{Krylov.jl: a Julia package for iterative methods to solve linear systems.}
+\url{https://github.com/JuliaSmoothOptimizers/Krylov.jl}
+
+\bibitem{cudajl}
+T. Besard et al.
+\emph{CUDA.jl.}
+\url{https://github.com/JuliaGPU/CUDA.jl}
+
+\bibitem{innes2018}
+M. Innes.
+\emph{Don't unroll adjoint: differentiating SSA-form programs.}
+arXiv:1810.07951, 2018.
+
+\end{thebibliography}
+
+\section*{Tool-use reflection}
+
+I came into this project already comfortable with Cursor, and it remained the most useful tool throughout. The hard part of this project was not understanding the math or motivation --- I was already deep in that from my research --- but writing and restructuring a lot of code quickly. In particular, I was porting ideas from an existing PyTorch/CUDA codebase into a Julia framework, so the central challenge was turning a bespoke implementation into reusable abstractions.
+
+In practice, Cursor was strongest for day-to-day code-level edits while I pointed it at concrete reference implementations in other languages. Because this was my first serious Julia project, that loop was especially valuable: I could describe an intended behavior, provide analogous Python/CUDA code, and iterate fast on a Julia version. I also used it for LaTeX cleanup in report editing. I did not use autonomous agent workflows for this project (although I am very curious about these! I will be experimenting with them this summer); my usage was mostly direct, interactive editing assistance inside the IDE.
+
+The biggest success case was implementation speed for framework plumbing: interfaces, wrappers, and repetitive refactors that would have been slow to write from scratch in a new language. The main frustration was that generated code could be a little lazy on performance: correct and clean enough to run, but not always matching the efficiency I expected. In all honesty, this matches what I expected: the code these models have been trained on is not always the most performant, and Cursor must always balance pure numerical performance with readability, maintainability, and correctness. I handled that by pairing development with timing scripts while porting each feature. When the Julia version ran slower than my Python baseline on the same data, I treated that as a sign to inspect the generated path more closely, then rewrote hotspots manually.
+
+My workflow remained a tight loop of: specify behavior, generate/edit quickly, benchmark immediately, and only trust code after performance checks. The lesson I'm left with is to treat AI as a fast drafting partner: it is excellent for momentum and boilerplate, but for numerical computing you still need explicit profiling, benchmark-based validation, and domain judgment to get to a research-quality result.
+
+\end{document}
